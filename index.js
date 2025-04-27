@@ -8,181 +8,246 @@ const {
   useMultiFileAuthState,
   delay,
   makeCacheableSignalKeyStore,
+  Browsers,
 } = require("maher-zubair-baileys");
 
 const app = express();
-const PORT = process.env.PORT || 5000;
+const PORT = 5000;
 
-// Create directories if not exists
-if (!fs.existsSync("temp")) fs.mkdirSync("temp");
-if (!fs.existsSync("uploads")) fs.mkdirSync("uploads");
+// Create necessary directories
+if (!fs.existsSync("temp")) {
+  fs.mkdirSync("temp");
+}
+if (!fs.existsSync("uploads")) {
+  fs.mkdirSync("uploads");
+}
 
 const upload = multer({ dest: "uploads/" });
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Store all active sessions
+// Store active client instances
 const activeClients = new Map();
 
-// HTML Homepage
 app.get("/", (req, res) => {
   res.send(`
     <html>
     <head>
-      <title>WhatsApp Auto Sender</title>
+      <title>WhatsApp Message Sender</title>
       <style>
-        body { font-family: Arial; background: #f0f8ff; text-align: center; padding: 20px; }
-        .box { background: #fff; border-radius: 10px; padding: 20px; margin: 10px auto; max-width: 500px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-        input, button, select { width: 90%; padding: 10px; margin: 10px 0; border: 1px solid #ddd; border-radius: 5px; }
-        button { background: #4CAF50; color: white; border: none; cursor: pointer; }
-        button:hover { background: #45a049; }
+        body { background: #ff69b4; color: green; text-align: center; font-size: 20px; }
+        input, button, select { display: block; margin: 10px auto; padding: 10px; font-size: 16px; }
+        .box { background: yellow; padding: 20px; border-radius: 10px; margin: 20px auto; max-width: 600px; }
+        .active-sessions { background: white; padding: 15px; border-radius: 10px; margin-top: 20px; }
       </style>
     </head>
     <body>
-      <h1>WhatsApp Bulk Sender</h1>
-      
+      <h2>WhatsApp Auto Sender</h2>
       <div class="box">
-        <h3>Generate Pairing Code</h3>
         <form action="/code" method="GET">
-          <input type="text" name="number" placeholder="Your WhatsApp Number" required>
-          <button type="submit">Get Pairing Code</button>
+          <input type="text" name="number" placeholder="Enter Your WhatsApp Number" required>
+          <button type="submit">Generate Pairing Code</button>
         </form>
       </div>
 
       <div class="box">
-        <h3>Send Messages</h3>
         <form action="/send-message" method="POST" enctype="multipart/form-data">
-          <input type="text" name="taskId" placeholder="Your Task ID" required>
+          <input type="text" name="taskId" placeholder="Enter Your Task ID" required>
           <select name="targetType" required>
-            <option value="">Select Target Type</option>
-            <option value="number">Number</option>
-            <option value="group">Group</option>
+            <option value="">-- Select Target Type --</option>
+            <option value="number">Target Number</option>
+            <option value="group">Group UID</option>
           </select>
-          <input type="text" name="target" placeholder="Target Number/Group ID" required>
+          <input type="text" name="target" placeholder="Enter Target Number / Group UID" required>
           <input type="file" name="messageFile" accept=".txt" required>
-          <input type="number" name="delaySec" placeholder="Delay (Seconds)" required>
-          <button type="submit">Start Sending</button>
+          <input type="number" name="delaySec" placeholder="Delay in Seconds" required>
+          <button type="submit">Send Message</button>
         </form>
       </div>
 
       <div class="box">
-        <h3>Stop Task</h3>
         <form action="/stop-task" method="POST">
-          <input type="text" name="taskId" placeholder="Enter Task ID to Stop" required>
-          <button type="submit" style="background: #f44336;">Stop My Task</button>
+          <input type="text" name="taskId" placeholder="Enter Your Task ID to Stop" required>
+          <button type="submit">Stop My Task</button>
         </form>
       </div>
 
-      <div class="box">
-        <h3>Active Users: ${activeClients.size}</h3>
-        <p>Render.com Free Tier = 10 Users Max (500 MB RAM)</p>
+      <div class="active-sessions">
+        <h3>Active Sessions: ${activeClients.size}</h3>
       </div>
     </body>
     </html>
   `);
 });
 
-// Generate Pairing Code
 app.get("/code", async (req, res) => {
   const num = req.query.number.replace(/[^0-9]/g, "");
   const taskId = `task_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
   const tempPath = path.join("temp", taskId);
 
-  if (!fs.existsSync(tempPath)) fs.mkdirSync(tempPath, { recursive: true });
+  if (!fs.existsSync(tempPath)) {
+    fs.mkdirSync(tempPath, { recursive: true });
+  }
 
   try {
     const { state, saveCreds } = await useMultiFileAuthState(tempPath);
+    
     const waClient = Gifted_Tech({
-      auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, pino()) },
+      auth: {
+        creds: state.creds,
+        keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "fatal" }).child({ level: "fatal" })),
+      },
       printQRInTerminal: false,
-      logger: pino({ level: "silent" }),
+      logger: pino({ level: "fatal" }).child({ level: "fatal" }),
+      browser: ["Chrome (Linux)", "", ""],
     });
 
     if (!waClient.authState.creds.registered) {
+      await delay(1500);
       const code = await waClient.requestPairingCode(num);
-      activeClients.set(taskId, { client: waClient, number: num, authPath: tempPath });
+      
+      // Store client instance with taskId
+      activeClients.set(taskId, {
+        client: waClient,
+        number: num,
+        authPath: tempPath
+      });
 
       res.send(`
-        <div class="box" style="max-width: 600px;">
-          <h2>✅ Task Created Successfully!</h2>
-          <p><strong>Task ID:</strong> ${taskId}</p>
-          <p><strong>Pairing Code:</strong> ${code}</p>
-          <p>Use this Task ID to send messages later.</p>
-          <a href="/" style="display: inline-block; margin-top: 20px; padding: 10px 15px; background: #4CAF50; color: white; text-decoration: none; border-radius: 5px;">Go Back</a>
-        </div>
+        <h2>Your Task ID: ${taskId}</h2>
+        <h2>Pairing Code: ${code}</h2>
+        <p>Save this Task ID to send messages later</p>
+        <br><a href="/">Go Back</a>
       `);
     }
 
     waClient.ev.on("creds.update", saveCreds);
-    waClient.ev.on("connection.update", (s) => {
-      if (s.connection === "close") {
-        console.log(`[${taskId}] Disconnected! Reconnecting in 10 sec...`);
-        setTimeout(() => initializeClient(taskId, num, tempPath), 10000);
+    waClient.ev.on("connection.update", async (s) => {
+      const { connection, lastDisconnect } = s;
+      if (connection === "open") {
+        console.log(`WhatsApp Connected for ${num}! Task ID: ${taskId}`);
+      } else if (connection === "close" && lastDisconnect?.error?.output?.statusCode !== 401) {
+        console.log(`Reconnecting for Task ID: ${taskId}...`);
+        await delay(10000);
+        // Reinitialize the client instead of trying to reconnect directly
+        initializeClient(taskId, num, tempPath);
       }
     });
   } catch (err) {
-    res.send(`<h2>Error: ${err.message}</h2><a href="/">Go Back</a>`);
+    console.error("Error in pairing:", err);
+    res.send(`<h2>Error: ${err.message}</h2><br><a href="/">Go Back</a>`);
   }
 });
 
-// Reconnect Logic
 async function initializeClient(taskId, num, tempPath) {
   try {
     const { state, saveCreds } = await useMultiFileAuthState(tempPath);
+    
     const waClient = Gifted_Tech({
-      auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, pino()) },
-      logger: pino({ level: "silent" }),
+      auth: {
+        creds: state.creds,
+        keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "fatal" }).child({ level: "fatal" })),
+      },
+      printQRInTerminal: false,
+      logger: pino({ level: "fatal" }).child({ level: "fatal" }),
+      browser: ["Chrome (Linux)", "", ""],
     });
 
-    activeClients.set(taskId, { client: waClient, number: num, authPath: tempPath });
+    activeClients.set(taskId, {
+      client: waClient,
+      number: num,
+      authPath: tempPath
+    });
+
     waClient.ev.on("creds.update", saveCreds);
-    console.log(`[${taskId}] Reconnected Successfully!`);
+    waClient.ev.on("connection.update", async (s) => {
+      const { connection, lastDisconnect } = s;
+      if (connection === "open") {
+        console.log(`Reconnected successfully for Task ID: ${taskId}`);
+      } else if (connection === "close" && lastDisconnect?.error?.output?.statusCode !== 401) {
+        console.log(`Reconnecting again for Task ID: ${taskId}...`);
+        await delay(10000);
+        initializeClient(taskId, num, tempPath);
+      }
+    });
   } catch (err) {
-    console.log(`[${taskId}] Reconnect Failed: ${err.message}`);
+    console.error(`Reconnection failed for Task ID: ${taskId}`, err);
   }
 }
 
-// Send Messages
 app.post("/send-message", upload.single("messageFile"), async (req, res) => {
   const { taskId, target, targetType, delaySec } = req.body;
-  if (!activeClients.has(taskId)) return res.send(`<h2>❌ Invalid Task ID</h2><a href="/">Go Back</a>`);
+  
+  if (!activeClients.has(taskId)) {
+    return res.send(`<h2>Error: Invalid Task ID or session expired</h2><br><a href="/">Go Back</a>`);
+  }
 
   const { client: waClient } = activeClients.get(taskId);
   const filePath = req.file?.path;
-  const messages = fs.readFileSync(filePath, "utf-8").split("\n").filter(m => m.trim());
 
-  activeClients.get(taskId).isSending = true;
-  activeClients.get(taskId).stopRequested = false;
+  if (!target || !filePath || !targetType || !delaySec) {
+    return res.send(`<h2>Error: Missing required fields</h2><br><a href="/">Go Back</a>`);
+  }
 
   try {
+    const messages = fs.readFileSync(filePath, "utf-8").split("\n").filter(msg => msg.trim() !== "");
+    let index = 0;
+
+    // Store message sending state
+    activeClients.get(taskId).isSending = true;
+    activeClients.get(taskId).stopRequested = false;
+
     while (activeClients.get(taskId).isSending && !activeClients.get(taskId).stopRequested) {
-      for (const msg of messages) {
-        if (activeClients.get(taskId).stopRequested) break;
-        await waClient.sendMessage(
-          targetType === "group" ? `${target}@g.us` : `${target}@s.whatsapp.net`,
-          { text: msg }
-        );
-        await delay(delaySec * 1000);
-      }
+      const msg = messages[index];
+      const recipient = targetType === "group" ? target + "@g.us" : target + "@s.whatsapp.net";
+
+      await waClient.sendMessage(recipient, { text: msg });
+      console.log(`[${taskId}] Sent message to ${target}`);
+
+      index = (index + 1) % messages.length;
+      await delay(delaySec * 1000);
     }
-    res.send(`<h2>✅ Messages Sent Successfully!</h2><a href="/">Go Back</a>`);
-  } catch (err) {
-    res.send(`<h2>❌ Error: ${err.message}</h2><a href="/">Go Back</a>`);
+
+    res.send(`<h2>Message sending ${activeClients.get(taskId).stopRequested ? 'stopped' : 'completed'}!</h2><br><a href="/">Go Back</a>`);
+  } catch (error) {
+    console.error(`[${taskId}] Error:`, error);
+    res.send(`<h2>Error: Failed to send messages</h2><br><a href="/">Go Back</a>`);
   } finally {
-    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+    }
   }
 });
 
-// Stop Task
-app.post("/stop-task", (req, res) => {
+app.post("/stop-task", async (req, res) => {
   const { taskId } = req.body;
-  if (activeClients.has(taskId)) {
+  
+  if (!activeClients.has(taskId)) {
+    return res.send(`<h2>Error: Invalid Task ID</h2><br><a href="/">Go Back</a>`);
+  }
+
+  try {
     activeClients.get(taskId).stopRequested = true;
-    res.send(`<h2>🛑 Task Stopped: ${taskId}</h2><a href="/">Go Back</a>`);
-  } else {
-    res.send(`<h2>❌ Task Not Found</h2><a href="/">Go Back</a>`);
+    activeClients.get(taskId).isSending = false;
+    
+    res.send(`<h2>Task ${taskId} stopped successfully</h2><br><a href="/">Go Back</a>`);
+  } catch (error) {
+    console.error(`Error stopping task ${taskId}:`, error);
+    res.send(`<h2>Error stopping task</h2><br><a href="/">Go Back</a>`);
   }
 });
 
-// Start Server
-app.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));
+// Cleanup on server close
+process.on('SIGINT', () => {
+  console.log('Shutting down gracefully...');
+  activeClients.forEach(({ client }, taskId) => {
+    client.end();
+    console.log(`Closed connection for Task ID: ${taskId}`);
+  });
+  process.exit();
+});
+
+app.listen(PORT, () => {
+  console.log(`Server running on http://localhost:${PORT}`);
+});
