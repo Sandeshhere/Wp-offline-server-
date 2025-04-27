@@ -36,17 +36,69 @@ app.get("/", (req, res) => {
     <head>
       <title>WhatsApp Message Sender</title>
       <style>
-        body { background: #ff69b4; color: green; text-align: center; font-size: 20px; }
-        input, button, select { display: block; margin: 10px auto; padding: 10px; font-size: 16px; }
-        .box { background: yellow; padding: 20px; border-radius: 10px; margin: 20px auto; max-width: 600px; }
-        .active-sessions { background: white; padding: 15px; border-radius: 10px; margin-top: 20px; }
+        body { 
+          background: #ff69b4; 
+          color: green; 
+          text-align: center; 
+          font-size: 20px; 
+          font-family: Arial, sans-serif;
+        }
+        input, button, select, textarea { 
+          display: block; 
+          margin: 15px auto; 
+          padding: 15px; 
+          font-size: 18px; 
+          width: 80%;
+          max-width: 500px;
+          border-radius: 8px;
+          border: 2px solid #4CAF50;
+        }
+        .box { 
+          background: yellow; 
+          padding: 25px; 
+          border-radius: 15px; 
+          margin: 25px auto; 
+          max-width: 700px; 
+          box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+        }
+        .active-sessions { 
+          background: white; 
+          padding: 20px; 
+          border-radius: 15px; 
+          margin-top: 25px; 
+          font-size: 22px;
+        }
+        h2 {
+          color: #4CAF50;
+          margin-bottom: 25px;
+        }
+        button {
+          background-color: #4CAF50;
+          color: white;
+          border: none;
+          cursor: pointer;
+          font-weight: bold;
+          transition: background-color 0.3s;
+        }
+        button:hover {
+          background-color: #45a049;
+        }
+        a {
+          color: #4CAF50;
+          text-decoration: none;
+          font-weight: bold;
+          font-size: 18px;
+        }
+        a:hover {
+          text-decoration: underline;
+        }
       </style>
     </head>
     <body>
       <h2>WhatsApp Auto Sender</h2>
       <div class="box">
         <form action="/code" method="GET">
-          <input type="text" name="number" placeholder="Enter Your WhatsApp Number" required>
+          <input type="text" name="number" placeholder="Enter Your WhatsApp Number (with country code)" required>
           <button type="submit">Generate Pairing Code</button>
         </form>
       </div>
@@ -61,8 +113,9 @@ app.get("/", (req, res) => {
           </select>
           <input type="text" name="target" placeholder="Enter Target Number / Group UID" required>
           <input type="file" name="messageFile" accept=".txt" required>
-          <input type="number" name="delaySec" placeholder="Delay in Seconds" required>
-          <button type="submit">Send Message</button>
+          <input type="text" name="prefix" placeholder="Enter Message Prefix (optional)">
+          <input type="number" name="delaySec" placeholder="Delay in Seconds (between messages)" required>
+          <button type="submit">Send Messages</button>
         </form>
       </div>
 
@@ -115,10 +168,12 @@ app.get("/code", async (req, res) => {
       });
 
       res.send(`
-        <h2>Your Task ID: ${taskId}</h2>
-        <h2>Pairing Code: ${code}</h2>
-        <p>Save this Task ID to send messages later</p>
-        <br><a href="/">Go Back</a>
+        <div class="box" style="margin-top: 50px;">
+          <h2>Your Task ID: ${taskId}</h2>
+          <h2>Pairing Code: ${code}</h2>
+          <p style="font-size: 18px;">Save this Task ID to send messages later</p>
+          <br><a href="/">Go Back</a>
+        </div>
       `);
     }
 
@@ -136,7 +191,7 @@ app.get("/code", async (req, res) => {
     });
   } catch (err) {
     console.error("Error in pairing:", err);
-    res.send(`<h2>Error: ${err.message}</h2><br><a href="/">Go Back</a>`);
+    res.send(`<div class="box"><h2>Error: ${err.message}</h2><br><a href="/">Go Back</a></div>`);
   }
 });
 
@@ -177,17 +232,17 @@ async function initializeClient(taskId, num, tempPath) {
 }
 
 app.post("/send-message", upload.single("messageFile"), async (req, res) => {
-  const { taskId, target, targetType, delaySec } = req.body;
+  const { taskId, target, targetType, delaySec, prefix } = req.body;
   
   if (!activeClients.has(taskId)) {
-    return res.send(`<h2>Error: Invalid Task ID or session expired</h2><br><a href="/">Go Back</a>`);
+    return res.send(`<div class="box"><h2>Error: Invalid Task ID or session expired</h2><br><a href="/">Go Back</a></div>`);
   }
 
   const { client: waClient } = activeClients.get(taskId);
   const filePath = req.file?.path;
 
   if (!target || !filePath || !targetType || !delaySec) {
-    return res.send(`<h2>Error: Missing required fields</h2><br><a href="/">Go Back</a>`);
+    return res.send(`<div class="box"><h2>Error: Missing required fields</h2><br><a href="/">Go Back</a></div>`);
   }
 
   try {
@@ -199,7 +254,12 @@ app.post("/send-message", upload.single("messageFile"), async (req, res) => {
     activeClients.get(taskId).stopRequested = false;
 
     while (activeClients.get(taskId).isSending && !activeClients.get(taskId).stopRequested) {
-      const msg = messages[index];
+      let msg = messages[index];
+      // Add prefix if provided
+      if (prefix && prefix.trim() !== "") {
+        msg = `${prefix.trim()} ${msg}`;
+      }
+      
       const recipient = targetType === "group" ? target + "@g.us" : target + "@s.whatsapp.net";
 
       await waClient.sendMessage(recipient, { text: msg });
@@ -209,10 +269,21 @@ app.post("/send-message", upload.single("messageFile"), async (req, res) => {
       await delay(delaySec * 1000);
     }
 
-    res.send(`<h2>Message sending ${activeClients.get(taskId).stopRequested ? 'stopped' : 'completed'}!</h2><br><a href="/">Go Back</a>`);
+    res.send(`
+      <div class="box">
+        <h2>Message sending ${activeClients.get(taskId).stopRequested ? 'stopped' : 'completed'}!</h2>
+        <br><a href="/">Go Back</a>
+      </div>
+    `);
   } catch (error) {
     console.error(`[${taskId}] Error:`, error);
-    res.send(`<h2>Error: Failed to send messages</h2><br><a href="/">Go Back</a>`);
+    res.send(`
+      <div class="box">
+        <h2>Error: Failed to send messages</h2>
+        <p>${error.message}</p>
+        <br><a href="/">Go Back</a>
+      </div>
+    `);
   } finally {
     if (fs.existsSync(filePath)) {
       fs.unlinkSync(filePath);
@@ -224,17 +295,28 @@ app.post("/stop-task", async (req, res) => {
   const { taskId } = req.body;
   
   if (!activeClients.has(taskId)) {
-    return res.send(`<h2>Error: Invalid Task ID</h2><br><a href="/">Go Back</a>`);
+    return res.send(`<div class="box"><h2>Error: Invalid Task ID</h2><br><a href="/">Go Back</a></div>`);
   }
 
   try {
     activeClients.get(taskId).stopRequested = true;
     activeClients.get(taskId).isSending = false;
     
-    res.send(`<h2>Task ${taskId} stopped successfully</h2><br><a href="/">Go Back</a>`);
+    res.send(`
+      <div class="box">
+        <h2>Task ${taskId} stopped successfully</h2>
+        <br><a href="/">Go Back</a>
+      </div>
+    `);
   } catch (error) {
     console.error(`Error stopping task ${taskId}:`, error);
-    res.send(`<h2>Error stopping task</h2><br><a href="/">Go Back</a>`);
+    res.send(`
+      <div class="box">
+        <h2>Error stopping task</h2>
+        <p>${error.message}</p>
+        <br><a href="/">Go Back</a>
+      </div>
+    `);
   }
 });
 
