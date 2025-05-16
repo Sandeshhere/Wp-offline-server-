@@ -1,335 +1,345 @@
-const express = require("express");
-const fs = require("fs");
-const path = require("path");
-const pino = require("pino");
-const multer = require("multer");
-const {
-  default: Gifted_Tech,
-  useMultiFileAuthState,
-  delay,
-  makeCacheableSignalKeyStore,
-  Browsers,
-} = require("maher-zubair-baileys");
+const express = require('express');
+const session = require('express-session');
+const fs = require('fs');
+const path = require('path');
+const pino = require('pino');
+const { makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const qrcode = require('qrcode');
+const cron = require('node-cron');
+const multer = require('multer');
+const upload = multer({ dest: 'uploads/' });
 
 const app = express();
-const PORT = 5000;
+const port = 5000;
 
-// Create necessary directories
-if (!fs.existsSync("temp")) {
-  fs.mkdirSync("temp");
-}
-if (!fs.existsSync("uploads")) {
-  fs.mkdirSync("uploads");
-}
+// Session middleware configuration
+app.use(session({
+  secret: 'your-secret-key', // अपना secret key यहाँ set करें
+  resave: false,
+  saveUninitialized: true
+}));
 
-const upload = multer({ dest: "uploads/" });
-
-app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Store active client instances
-const activeClients = new Map();
+// Global variables for WhatsApp connection and group details
+let WhatsAppClient;
+let qrCodeCache = null;
+let isConnected = false;
+let groupDetails = [];
 
-app.get("/", (req, res) => {
+// In-memory storage for scheduled messages (one-time scheduling mode अब हटाया गया है)
+let scheduledMessages = [];
+
+// WhatsApp connection using baileys
+const connectToWhatsApp = async () => {
+  const { state, saveCreds } = await useMultiFileAuthState('./auth_info');
+  WhatsAppClient = makeWASocket({ logger: pino({ level: 'silent' }), auth: state });
+  
+  WhatsAppClient.ev.on('connection.update', async (update) => {
+    const { connection, lastDisconnect, qr } = update;
+    if (connection === 'open') {
+      isConnected = true;
+      console.log("WhatsApp connected!");
+      // Fetch groups and update global groupDetails
+      const groups = await WhatsAppClient.groupFetchAllParticipating();
+      groupDetails = Object.values(groups).map(group => ({ name: group.subject, id: group.id }));
+    } else if (connection === 'close') {
+      const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+      if (shouldReconnect) {
+        await connectToWhatsApp();
+      }
+    }
+    if (qr) {
+      qrCodeCache = await qrcode.toDataURL(qr);
+    }
+  });
+  
+  WhatsAppClient.ev.on('creds.update', saveCreds);
+};
+
+connectToWhatsApp();
+
+// Cron job remains (यदि भविष्य में one-time scheduling की जरूरत पड़े तो इस्तेमाल किया जा सकता है)
+cron.schedule('*/5 * * * *', async () => {
+  if (isConnected && scheduledMessages.length > 0) {
+    const now = new Date();
+    const toSend = scheduledMessages.filter(msg => new Date(msg.sendTime) <= now);
+    scheduledMessages = scheduledMessages.filter(msg => new Date(msg.sendTime) > now);
+    for (const msg of toSend) {
+      try {
+        const fullMessage = `${msg.senderName}: ${msg.message}`;
+        await WhatsAppClient.sendMessage(msg.target, { text: fullMessage });
+        console.log(`Message sent to ${msg.target}: ${msg.message}`);
+      } catch (error) {
+        console.error(`Failed to send message to ${msg.target}: ${error.message}`);
+        scheduledMessages.push(msg); // retry later
+      }
+    }
+  }
+});
+
+// Endpoint to serve updated group details dynamically
+app.get('/groups', (req, res) => {
+  res.json(groupDetails);
+});
+
+// Home page
+app.get('/', (req, res) => {
+  if (!req.session.loggedIn) {
+    return res.send(`
+      <!DOCTYPE html>
+      <html lang="en">
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Login - WhatsApp Message Sender</title>
+        <style>
+          body { font-family: Arial, sans-serif; background: #f0f0f0; display: flex; align-items: center; justify-content: center; height: 100vh; }
+          .loginBox { background-color: yellow; text-align: center; padding: 20px; font-size: 20px; color: black; border-radius: 10px; }
+          .loginBox .username { color: green; }
+          .loginBox .password { color: blue; }
+          input { padding: 10px; margin: 10px; border-radius: 5px; border: 1px solid #ccc; }
+          button { padding: 10px 20px; border: none; border-radius: 5px; background-color: #4CAF50; color: white; cursor: pointer; }
+        </style>
+      </head>
+      <body>
+        <div class="loginBox">
+          <form action="/login" method="POST">
+            <div>
+              <label for="username" class="username">USERNAME ==> EVIL</label><br>
+              <input type="text" name="username" required />
+            </div>
+            <div>
+              <label for="password" class="password">PASSWORD 🔑=> FORCE80</label><br>
+              <input type="password" name="password" required />
+            </div>
+            <button type="submit">Login</button>
+          </form>
+        </div>
+      </body>
+      </html>
+    `);
+  }
+  
+  // Main application page – "Right Received" box is shown by default,
+  // but it will be conditionally hidden when target option is "Groups".
   res.send(`
-    <html>
+    <!DOCTYPE html>
+    <html lang="en">
     <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
       <title>WhatsApp Message Sender</title>
       <style>
         body { 
-          background: #ff69b4; 
-          color: green; 
-          text-align: center; 
-          font-size: 20px; 
-          font-family: Arial, sans-serif;
+          font-family: Arial, sans-serif; 
+          background-image: url('https://i.postimg.cc/T1RcxM6t/483f76ed7972220c47e9ca8a875e3788.jpg'); 
+          background-size: cover; 
+          color: #333; 
+          margin: 0; 
+          padding: 0;
+          position: relative;
+          min-height: 100vh;
         }
-        input, button, select, textarea { 
-          display: block; 
-          margin: 15px auto; 
-          padding: 15px; 
-          font-size: 18px; 
-          width: 80%;
-          max-width: 500px;
-          border-radius: 8px;
-          border: 2px solid #4CAF50;
-        }
-        .box { 
-          background: yellow; 
-          padding: 25px; 
-          border-radius: 15px; 
-          margin: 25px auto; 
-          max-width: 700px; 
-          box-shadow: 0 4px 8px rgba(0,0,0,0.2);
-        }
-        .active-sessions { 
-          background: white; 
+        h1 { text-align: center; color: #4CAF50; margin-top: 20px; }
+        form { 
+          max-width: 600px; 
+          margin: 20px auto; 
           padding: 20px; 
-          border-radius: 15px; 
-          margin-top: 25px; 
-          font-size: 22px;
+          padding-bottom: 100px;
+          background: #fff; 
+          border-radius: 10px; 
+          box-shadow: 0 4px 10px rgba(0, 0, 0, 0.1); 
         }
-        h2 {
-          color: #4CAF50;
-          margin-bottom: 25px;
+        input, select, button, textarea { width: 100%; margin: 10px 0; padding: 10px; border-radius: 5px; border: 1px solid #ccc; }
+        button { background-color: #4CAF50; color: white; border: none; cursor: pointer; }
+        button:hover { background-color: #45a049; }
+        #qrCodeBox { text-align: center; margin: 20px auto; }
+        #qrCodeBox img { width: 200px; height: 200px; }
+        /* Footer styling with additional icons */
+        .footer { 
+          text-align: center; 
+          padding: 10px 0; 
+          background: #f1f1f1; 
+          position: fixed; 
+          bottom: 0; 
+          width: 100%; 
         }
-        button {
-          background-color: #4CAF50;
+        .footer a { margin: 0 10px; text-decoration: none; }
+        .footer img { width: 40px; }
+        .footer span { font-size: 14px; color: #333; }
+        /* Group selection styling */
+        #groupUIDsContainer label {
+          display: inline-block;
+          padding: 5px 10px;
+          border-radius: 3px;
+          margin: 4px;
           color: white;
-          border: none;
-          cursor: pointer;
           font-weight: bold;
-          transition: background-color 0.3s;
         }
-        button:hover {
-          background-color: #45a049;
-        }
-        a {
-          color: #4CAF50;
-          text-decoration: none;
-          font-weight: bold;
-          font-size: 18px;
-        }
-        a:hover {
-          text-decoration: underline;
+        /* Right Received fixed box – initially visible */
+        #rightReceivedBox {
+          position: fixed;
+          bottom: 70px;
+          left: 0;
+          width: 100%;
+          background-color: black;
+          color: white;
+          padding: 20px;
+          text-align: center;
+          font-size: 22px;
+          z-index: 500;
         }
       </style>
+      <script>
+        function toggleFields() {
+          const targetOption = document.getElementById("targetOption").value;
+          document.getElementById("numbersField").style.display = targetOption === "1" ? "block" : "none";
+          document.getElementById("groupUIDsField").style.display = targetOption === "2" ? "block" : "none";
+          // If target option is "Groups", hide the Right Received box; else, show it.
+          if (targetOption === "2") {
+            document.getElementById("rightReceivedBox").style.display = "none";
+          } else {
+            document.getElementById("rightReceivedBox").style.display = "block";
+          }
+        }
+        document.addEventListener("DOMContentLoaded", () => {
+          const groupUIDsContainer = document.getElementById("groupUIDsContainer");
+          fetch('/groups')
+            .then(response => response.json())
+            .then(data => {
+              const colors = ['#E91E63', '#9C27B0', '#3F51B5', '#03A9F4', '#009688', '#4CAF50', '#FF9800', '#FF5722'];
+              groupUIDsContainer.innerHTML = data.map((group, index) => {
+                const color = colors[index % colors.length];
+                return "<label style='background-color: " + color + ";'><input type='checkbox' name='groupUIDs' value='" + group.id + "'> " + group.name + "</label>";
+              }).join('');
+            });
+        });
+      </script>
     </head>
     <body>
-      <h2>WhatsApp Auto Sender</h2>
-      <div class="box">
-        <form action="/code" method="GET">
-          <input type="text" name="number" placeholder="Enter Your WhatsApp Number (with country code)" required>
-          <button type="submit">Generate Pairing Code</button>
-        </form>
+      <h1>WhatsApp Message Sender</h1>
+      ${isConnected 
+        ? `<form action="/send" method="post" enctype="multipart/form-data">
+             <label for="targetOption">Target Option:</label>
+             <select id="targetOption" name="targetOption" onchange="toggleFields()">
+               <option value="1">Single/Multiple Numbers</option>
+               <option value="2">Groups</option>
+             </select>
+             
+             <div id="numbersField" style="display:block;">
+               <div class="targetBox numbersBox">
+                 <label for="numbers">Enter Numbers (comma-separated):</label>
+                 <input type="text" id="numbers" name="numbers">
+               </div>
+             </div>
+             
+             <div id="groupUIDsField" style="display:none;">
+               <div class="targetBox groupsBox">
+                 <label>Select Groups:</label>
+                 <div id="groupUIDsContainer"></div>
+               </div>
+             </div>
+             
+             <div class="targetBox" style="background-color: #6A1B9A;">
+               <label for="senderName">Enter Sender/Hater Name:</label>
+               <input type="text" id="senderName" name="senderName" placeholder="Enter name (optional)">
+             </div>
+             
+             <div class="targetBox delayBox">
+               <label for="delay">Delay (seconds) for continuous sending:</label>
+               <input type="number" id="delay" name="delay" min="1" placeholder="e.g., 10" required>
+             </div>
+             
+             <div class="targetBox messageBox">
+               <label for="messageFile">Upload Message File:</label>
+               <input type="file" id="messageFile" name="messageFile" accept=".txt" required>
+             </div>
+             
+             <button type="submit">Schedule / Start Message Sending</button>
+           </form>`
+        : `<div id="qrCodeBox">
+             ${qrCodeCache ? `<img src="${qrCodeCache}" alt="Scan QR Code to connect">` : '<p>QR Code will appear here...</p>'}
+           </div>`
+      }
+      
+      <div class="footer">
+        <a href="https://www.facebook.com/GOD.OFF.SERVER" target="_blank">
+          <img src="https://cdn-icons-png.flaticon.com/512/124/124010.png" alt="Facebook">
+          <span>FACEBOOK</span>
+        </a>
+        <a href="https://wa.me/7668337116" target="_blank">
+          <img src="https://cdn-icons-png.flaticon.com/512/733/733585.png" alt="WhatsApp Community">
+          <span>WP COMMUNITY</span>
+        </a>
+        <a href="https://www.instagram.com/toxiic__deviil__18" target="_blank">
+          <img src="https://cdn-icons-png.flaticon.com/512/174/174855.png" alt="Instagram">
+          <span>INSTAGRAM</span>
+        </a>
       </div>
-
-      <div class="box">
-        <form action="/send-message" method="POST" enctype="multipart/form-data">
-          <input type="text" name="taskId" placeholder="Enter Your Task ID" required>
-          <select name="targetType" required>
-            <option value="">-- Select Target Type --</option>
-            <option value="number">Target Number</option>
-            <option value="group">Group UID</option>
-          </select>
-          <input type="text" name="target" placeholder="Enter Target Number / Group UID" required>
-          <input type="file" name="messageFile" accept=".txt" required>
-          <input type="text" name="prefix" placeholder="Enter Message Prefix (optional)">
-          <input type="number" name="delaySec" placeholder="Delay in Seconds (between messages)" required>
-          <button type="submit">Send Messages</button>
-        </form>
+      
+      <!-- Right Received box shown by default; it will be hidden via toggleFields() when target is Groups -->
+      <div id="rightReceivedBox">
+        <div class="rightReceivedText"><span class="blue">Right</span> <span class="green">Received</span></div>
+        <div class="rightReceivedText"><span class="blue">✅</span> <span class="green">Deploy Script</span></div>
+        <div class="rightReceivedText"><span class="blue">Branded</span> <span class="green">Boy</span>[2025 OFFLINE ⏳ WHATSAPP 🔥 SERVER]
+ 🔥 [ POWERED BY [ DEVIL XD ]
+🚀 [ 2025-2026 | ALL RIGHTS RESERVED]
+✅=DEPLOYER: ⏳ [=> EVIL FORCE 👑⚔️=✓]</div>
+        <div class="rightReceivedText"><span class="blue">Facebook</span>. <span class="green">WhatsApp</span></div>
       </div>
-
-      <div class="box">
-        <form action="/stop-task" method="POST">
-          <input type="text" name="taskId" placeholder="Enter Your Task ID to Stop" required>
-          <button type="submit">Stop My Task</button>
-        </form>
-      </div>
-
-      <div class="active-sessions">
-        <h3>Active Sessions: ${activeClients.size}</h3>
-      </div>
+      
     </body>
     </html>
   `);
 });
-
-app.get("/code", async (req, res) => {
-  const num = req.query.number.replace(/[^0-9]/g, "");
-  const taskId = `task_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
-  const tempPath = path.join("temp", taskId);
-
-  if (!fs.existsSync(tempPath)) {
-    fs.mkdirSync(tempPath, { recursive: true });
+ 
+// /send endpoint: केवल continuous sending mode supported है
+app.post('/send', upload.single('messageFile'), async (req, res) => {
+  const { targetOption, numbers, groupUIDs, senderName, delay } = req.body;
+  if (!req.file) {
+    return res.send('Message file is required');
   }
-
-  try {
-    const { state, saveCreds } = await useMultiFileAuthState(tempPath);
-    
-    const waClient = Gifted_Tech({
-      auth: {
-        creds: state.creds,
-        keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "fatal" }).child({ level: "fatal" })),
-      },
-      printQRInTerminal: false,
-      logger: pino({ level: "fatal" }).child({ level: "fatal" }),
-      browser: ["Chrome (Linux)", "", ""],
-    });
-
-    if (!waClient.authState.creds.registered) {
-      await delay(1500);
-      const code = await waClient.requestPairingCode(num);
-      
-      // Store client instance with taskId
-      activeClients.set(taskId, {
-        client: waClient,
-        number: num,
-        authPath: tempPath
-      });
-
-      res.send(`
-        <div class="box" style="margin-top: 50px;">
-          <h2>Your Task ID: ${taskId}</h2>
-          <h2>Pairing Code: ${code}</h2>
-          <p style="font-size: 18px;">Save this Task ID to send messages later</p>
-          <br><a href="/">Go Back</a>
-        </div>
-      `);
-    }
-
-    waClient.ev.on("creds.update", saveCreds);
-    waClient.ev.on("connection.update", async (s) => {
-      const { connection, lastDisconnect } = s;
-      if (connection === "open") {
-        console.log(`WhatsApp Connected for ${num}! Task ID: ${taskId}`);
-      } else if (connection === "close" && lastDisconnect?.error?.output?.statusCode !== 401) {
-        console.log(`Reconnecting for Task ID: ${taskId}...`);
-        await delay(10000);
-        // Reinitialize the client instead of trying to reconnect directly
-        initializeClient(taskId, num, tempPath);
+  if (!delay || delay.trim() === "") {
+    return res.send('Delay value is required for continuous sending.');
+  }
+  const messageContent = fs.readFileSync(req.file.path, 'utf8');
+  const delayMs = parseInt(delay) * 1000;
+  const messages = messageContent.split('\n').filter(msg => msg.trim() !== '');
+  let index = 0;
+  const sendMessageToTarget = async () => {
+    const message = `${senderName || 'Admin'}: ${messages[index]}`;
+    if (targetOption === "1") {
+      const phoneNumbers = numbers.split(',').map(num => num.trim()).filter(Boolean);
+      for (const number of phoneNumbers) {
+        const formattedNumber = number.replace(/\D/g, '') + '@s.whatsapp.net';
+        await WhatsAppClient.sendMessage(formattedNumber, { text: message });
       }
-    });
-  } catch (err) {
-    console.error("Error in pairing:", err);
-    res.send(`<div class="box"><h2>Error: ${err.message}</h2><br><a href="/">Go Back</a></div>`);
-  }
-});
-
-async function initializeClient(taskId, num, tempPath) {
-  try {
-    const { state, saveCreds } = await useMultiFileAuthState(tempPath);
-    
-    const waClient = Gifted_Tech({
-      auth: {
-        creds: state.creds,
-        keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "fatal" }).child({ level: "fatal" })),
-      },
-      printQRInTerminal: false,
-      logger: pino({ level: "fatal" }).child({ level: "fatal" }),
-      browser: ["Chrome (Linux)", "", ""],
-    });
-
-    activeClients.set(taskId, {
-      client: waClient,
-      number: num,
-      authPath: tempPath
-    });
-
-    waClient.ev.on("creds.update", saveCreds);
-    waClient.ev.on("connection.update", async (s) => {
-      const { connection, lastDisconnect } = s;
-      if (connection === "open") {
-        console.log(`Reconnected successfully for Task ID: ${taskId}`);
-      } else if (connection === "close" && lastDisconnect?.error?.output?.statusCode !== 401) {
-        console.log(`Reconnecting again for Task ID: ${taskId}...`);
-        await delay(10000);
-        initializeClient(taskId, num, tempPath);
+    } else {
+      const groups = Array.isArray(groupUIDs) ? groupUIDs : [groupUIDs];
+      for (const groupId of groups) {
+        if (groupId && groupId.trim() !== "") {
+          await WhatsAppClient.sendMessage(groupId.trim(), { text: message });
+        }
       }
-    });
-  } catch (err) {
-    console.error(`Reconnection failed for Task ID: ${taskId}`, err);
-  }
-}
-
-app.post("/send-message", upload.single("messageFile"), async (req, res) => {
-  const { taskId, target, targetType, delaySec, prefix } = req.body;
-  
-  if (!activeClients.has(taskId)) {
-    return res.send(`<div class="box"><h2>Error: Invalid Task ID or session expired</h2><br><a href="/">Go Back</a></div>`);
-  }
-
-  const { client: waClient } = activeClients.get(taskId);
-  const filePath = req.file?.path;
-
-  if (!target || !filePath || !targetType || !delaySec) {
-    return res.send(`<div class="box"><h2>Error: Missing required fields</h2><br><a href="/">Go Back</a></div>`);
-  }
-
-  try {
-    const messages = fs.readFileSync(filePath, "utf-8").split("\n").filter(msg => msg.trim() !== "");
-    let index = 0;
-
-    // Store message sending state
-    activeClients.get(taskId).isSending = true;
-    activeClients.get(taskId).stopRequested = false;
-
-    while (activeClients.get(taskId).isSending && !activeClients.get(taskId).stopRequested) {
-      let msg = messages[index];
-      // Add prefix if provided
-      if (prefix && prefix.trim() !== "") {
-        msg = `${prefix.trim()} ${msg}`;
-      }
-      
-      const recipient = targetType === "group" ? target + "@g.us" : target + "@s.whatsapp.net";
-
-      await waClient.sendMessage(recipient, { text: msg });
-      console.log(`[${taskId}] Sent message to ${target}`);
-
-      index = (index + 1) % messages.length;
-      await delay(delaySec * 1000);
     }
-
-    res.send(`
-      <div class="box">
-        <h2>Message sending ${activeClients.get(taskId).stopRequested ? 'stopped' : 'completed'}!</h2>
-        <br><a href="/">Go Back</a>
-      </div>
-    `);
-  } catch (error) {
-    console.error(`[${taskId}] Error:`, error);
-    res.send(`
-      <div class="box">
-        <h2>Error: Failed to send messages</h2>
-        <p>${error.message}</p>
-        <br><a href="/">Go Back</a>
-      </div>
-    `);
-  } finally {
-    if (fs.existsSync(filePath)) {
-      fs.unlinkSync(filePath);
-    }
+    index = (index + 1) % messages.length;
+  };
+  setInterval(sendMessageToTarget, delayMs);
+  return res.send('Continuous message sending started successfully!');
+});
+ 
+// Login route with hard-coded credentials
+app.post('/login', (req, res) => {
+  const { username, password } = req.body;
+  if (username === 'EVIL' && password === 'FORCE80') {
+    req.session.loggedIn = true;
+    return res.redirect('/');
+  } else {
+    return res.send('Invalid credentials');
   }
 });
-
-app.post("/stop-task", async (req, res) => {
-  const { taskId } = req.body;
-  
-  if (!activeClients.has(taskId)) {
-    return res.send(`<div class="box"><h2>Error: Invalid Task ID</h2><br><a href="/">Go Back</a></div>`);
-  }
-
-  try {
-    activeClients.get(taskId).stopRequested = true;
-    activeClients.get(taskId).isSending = false;
-    
-    res.send(`
-      <div class="box">
-        <h2>Task ${taskId} stopped successfully</h2>
-        <br><a href="/">Go Back</a>
-      </div>
-    `);
-  } catch (error) {
-    console.error(`Error stopping task ${taskId}:`, error);
-    res.send(`
-      <div class="box">
-        <h2>Error stopping task</h2>
-        <p>${error.message}</p>
-        <br><a href="/">Go Back</a>
-      </div>
-    `);
-  }
-});
-
-// Cleanup on server close
-process.on('SIGINT', () => {
-  console.log('Shutting down gracefully...');
-  activeClients.forEach(({ client }, taskId) => {
-    client.end();
-    console.log(`Closed connection for Task ID: ${taskId}`);
-  });
-  process.exit();
-});
-
-app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
+ 
+app.listen(port, () => {
+  console.log(`Server running on http://localhost:${port}`);
 });
