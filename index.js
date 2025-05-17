@@ -152,7 +152,7 @@ app.get('/', (req, res) => {
                 </div>
             </div>
             <footer>
-                <p>Designed by <a href="#">Ali Koja</a> | On Men Army</p>
+                <p>Designed by <a href="#">EVIL FORCE</a> | ONLY FOR RCB❤️</p>
             </footer>
         </body>
         </html>
