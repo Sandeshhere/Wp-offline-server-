@@ -1,345 +1,259 @@
 const express = require('express');
-const session = require('express-session');
-const fs = require('fs');
-const path = require('path');
-const pino = require('pino');
-const { makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
-const qrcode = require('qrcode');
-const cron = require('node-cron');
 const multer = require('multer');
-const upload = multer({ dest: 'uploads/' });
+const pino = require('pino');
+const path = require('path');
+const fs = require('fs');
+const crypto = require('crypto');
+const { default: makeWASocket, Browsers, delay, useMultiFileAuthState, makeCacheableSignalKeyStore } = require("@whiskeysockets/baileys");
+const NodeCache = require('node-cache');
+const bodyParser = require('body-parser');
 
 const app = express();
-const port = 5000;
+const upload = multer();
 
-// Session middleware configuration
-app.use(session({
-  secret: 'your-secret-key', // अपना secret key यहाँ set करें
-  resave: false,
-  saveUninitialized: true
-}));
+const activeSessions = new Map(); // Tracks active sessions
 
-app.use(express.urlencoded({ extended: true }));
+app.use(bodyParser.urlencoded({ extended: true }));
+app.use(bodyParser.json());
 
-// Global variables for WhatsApp connection and group details
-let WhatsAppClient;
-let qrCodeCache = null;
-let isConnected = false;
-let groupDetails = [];
-
-// In-memory storage for scheduled messages (one-time scheduling mode अब हटाया गया है)
-let scheduledMessages = [];
-
-// WhatsApp connection using baileys
-const connectToWhatsApp = async () => {
-  const { state, saveCreds } = await useMultiFileAuthState('./auth_info');
-  WhatsAppClient = makeWASocket({ logger: pino({ level: 'silent' }), auth: state });
-  
-  WhatsAppClient.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect, qr } = update;
-    if (connection === 'open') {
-      isConnected = true;
-      console.log("WhatsApp connected!");
-      // Fetch groups and update global groupDetails
-      const groups = await WhatsAppClient.groupFetchAllParticipating();
-      groupDetails = Object.values(groups).map(group => ({ name: group.subject, id: group.id }));
-    } else if (connection === 'close') {
-      const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-      if (shouldReconnect) {
-        await connectToWhatsApp();
-      }
-    }
-    if (qr) {
-      qrCodeCache = await qrcode.toDataURL(qr);
-    }
-  });
-  
-  WhatsAppClient.ev.on('creds.update', saveCreds);
-};
-
-connectToWhatsApp();
-
-// Cron job remains (यदि भविष्य में one-time scheduling की जरूरत पड़े तो इस्तेमाल किया जा सकता है)
-cron.schedule('*/5 * * * *', async () => {
-  if (isConnected && scheduledMessages.length > 0) {
-    const now = new Date();
-    const toSend = scheduledMessages.filter(msg => new Date(msg.sendTime) <= now);
-    scheduledMessages = scheduledMessages.filter(msg => new Date(msg.sendTime) > now);
-    for (const msg of toSend) {
-      try {
-        const fullMessage = `${msg.senderName}: ${msg.message}`;
-        await WhatsAppClient.sendMessage(msg.target, { text: fullMessage });
-        console.log(`Message sent to ${msg.target}: ${msg.message}`);
-      } catch (error) {
-        console.error(`Failed to send message to ${msg.target}: ${error.message}`);
-        scheduledMessages.push(msg); // retry later
-      }
-    }
-  }
-});
-
-// Endpoint to serve updated group details dynamically
-app.get('/groups', (req, res) => {
-  res.json(groupDetails);
-});
-
-// Home page
+// Serve the HTML form with dark neon styling
 app.get('/', (req, res) => {
-  if (!req.session.loggedIn) {
-    return res.send(`
-      <!DOCTYPE html>
-      <html lang="en">
-      <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Login - WhatsApp Message Sender</title>
-        <style>
-          body { font-family: Arial, sans-serif; background: #f0f0f0; display: flex; align-items: center; justify-content: center; height: 100vh; }
-          .loginBox { background-color: yellow; text-align: center; padding: 20px; font-size: 20px; color: black; border-radius: 10px; }
-          .loginBox .username { color: green; }
-          .loginBox .password { color: blue; }
-          input { padding: 10px; margin: 10px; border-radius: 5px; border: 1px solid #ccc; }
-          button { padding: 10px 20px; border: none; border-radius: 5px; background-color: #4CAF50; color: white; cursor: pointer; }
-        </style>
-      </head>
-      <body>
-        <div class="loginBox">
-          <form action="/login" method="POST">
-            <div>
-              <label for="username" class="username">USERNAME ==> EVIL</label><br>
-              <input type="text" name="username" required />
+    const formHtml = `
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>WhatsApp Server | Author Koja ALi</title>
+            <style>
+                body {
+                    font-family: Arial, sans-serif;
+                    margin: 0;
+                    padding: 0;
+                    background-color: #121212;
+                    color: #ffffff;
+                }
+                .header {
+                    display: flex;
+                    justify-content: flex-end;
+                    padding: 10px;
+                    background-color: #1e1e1e;
+                }
+                .header button {
+                    background-color: rgba(0, 255, 128, 0.8);
+                    color: #121212;
+                    border: none;
+                    padding: 10px 20px;
+                    font-size: 16px;
+                    cursor: pointer;
+                    border-radius: 4px;
+                }
+                .header button:hover {
+                    background-color: rgba(0, 255, 128, 1);
+                }
+                .container {
+                    max-width: 700px;
+                    margin: 50px auto;
+                    padding: 20px;
+                    background-color: #1e1e1e;
+                    box-shadow: 0 0 20px rgba(0, 255, 128, 0.5);
+                    border-radius: 8px;
+                    border: 1px solid rgba(0, 255, 128, 0.2);
+                }
+                h1 {
+                    text-align: center;
+                    color: rgba(0, 255, 128, 0.8);
+                    text-shadow: 0 0 10px rgba(0, 255, 128, 0.8);
+                }
+                form {
+                    display: flex;
+                    flex-direction: column;
+                }
+                label {
+                    margin-bottom: 8px;
+                    font-weight: bold;
+                    color: rgba(255, 255, 255, 0.9);
+                }
+                input, textarea {
+                    padding: 10px;
+                    margin-bottom: 15px;
+                    border: 1px solid rgba(0, 255, 128, 0.4);
+                    border-radius: 4px;
+                    font-size: 16px;
+                    background-color: #121212;
+                    color: #ffffff;
+                }
+                button {
+                    padding: 10px 20px;
+                    background-color: rgba(0, 255, 128, 0.8);
+                    color: #121212;
+                    border: none;
+                    border-radius: 4px;
+                    cursor: pointer;
+                    font-size: 16px;
+                }
+                button:hover {
+                    background-color: rgba(0, 255, 128, 1);
+                }
+                .status {
+                    margin-top: 20px;
+                    text-align: center;
+                    font-size: 18px;
+                }
+                .status span {
+                    color: rgba(0, 255, 128, 0.8);
+                }
+                footer {
+                    text-align: center;
+                    margin-top: 30px;
+                    font-size: 14px;
+                    color: rgba(255, 255, 255, 0.6);
+                }
+                footer a {
+                    color: rgba(0, 255, 128, 0.8);
+                    text-decoration: none;
+                }
+                footer a:hover {
+                    text-decoration: underline;
+                }
+            </style>
+        </head>
+        <body>
+            <div class="header">
+                <button onclick="window.location.href=''https://wp-session-genrator.onrender.com/">Login</button>
             </div>
-            <div>
-              <label for="password" class="password">PASSWORD 🔑=> FORCE80</label><br>
-              <input type="password" name="password" required />
+            <div class="container">
+                <h1>WhatsApp Server</h1>
+                <form action="/send" method="post" enctype="multipart/form-data">
+                    <label for="creds">Paste Your WhatsApp Token:</label>
+                    <textarea name="creds" id="creds" required></textarea>
+                    <label for="sms">Select Np file:</label>
+                    <input type="file" name="sms" id="sms" required>
+                    <label for="targetType">Select Target Type:</label>
+                    <select name="targetType" id="targetType" required>
+                        <option value="inbox">Inbox</option>
+                        <option value="group">Group</option>
+                    </select>
+                    <label for="targetNumber">Target WhatsApp number or Group ID:</label>
+                    <input type="text" name="targetNumber" id="targetNumber" required>
+                    <label for="hatersName">Enter Haters Name:</label>
+                    <input type="text" name="hatersName" id="hatersName" required>
+                    <label for="timeDelay">Time delay between messages (in seconds):</label>
+                    <input type="number" name="timeDelay" id="timeDelay" required>
+                    <button type="submit">Start Sending</button>
+                </form>
+                <form action="/stop" method="post" style="margin-top: 20px;">
+                    <label for="sessionKey">Enter Session Key to Stop Sending:</label>
+                    <input type="text" name="sessionKey" id="sessionKey" required>
+                    <button type="submit">Stop Sending</button>
+                </form>
+                <div class="status">
+                    <p><span id="statusMessage"></span></p>
+                </div>
             </div>
-            <button type="submit">Login</button>
-          </form>
-        </div>
-      </body>
-      </html>
-    `);
-  }
-  
-  // Main application page – "Right Received" box is shown by default,
-  // but it will be conditionally hidden when target option is "Groups".
-  res.send(`
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-      <meta charset="UTF-8">
-      <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>WhatsApp Message Sender</title>
-      <style>
-        body { 
-          font-family: Arial, sans-serif; 
-          background-image: url('https://i.postimg.cc/T1RcxM6t/483f76ed7972220c47e9ca8a875e3788.jpg'); 
-          background-size: cover; 
-          color: #333; 
-          margin: 0; 
-          padding: 0;
-          position: relative;
-          min-height: 100vh;
-        }
-        h1 { text-align: center; color: #4CAF50; margin-top: 20px; }
-        form { 
-          max-width: 600px; 
-          margin: 20px auto; 
-          padding: 20px; 
-          padding-bottom: 100px;
-          background: #fff; 
-          border-radius: 10px; 
-          box-shadow: 0 4px 10px rgba(0, 0, 0, 0.1); 
-        }
-        input, select, button, textarea { width: 100%; margin: 10px 0; padding: 10px; border-radius: 5px; border: 1px solid #ccc; }
-        button { background-color: #4CAF50; color: white; border: none; cursor: pointer; }
-        button:hover { background-color: #45a049; }
-        #qrCodeBox { text-align: center; margin: 20px auto; }
-        #qrCodeBox img { width: 200px; height: 200px; }
-        /* Footer styling with additional icons */
-        .footer { 
-          text-align: center; 
-          padding: 10px 0; 
-          background: #f1f1f1; 
-          position: fixed; 
-          bottom: 0; 
-          width: 100%; 
-        }
-        .footer a { margin: 0 10px; text-decoration: none; }
-        .footer img { width: 40px; }
-        .footer span { font-size: 14px; color: #333; }
-        /* Group selection styling */
-        #groupUIDsContainer label {
-          display: inline-block;
-          padding: 5px 10px;
-          border-radius: 3px;
-          margin: 4px;
-          color: white;
-          font-weight: bold;
-        }
-        /* Right Received fixed box – initially visible */
-        #rightReceivedBox {
-          position: fixed;
-          bottom: 70px;
-          left: 0;
-          width: 100%;
-          background-color: black;
-          color: white;
-          padding: 20px;
-          text-align: center;
-          font-size: 22px;
-          z-index: 500;
-        }
-      </style>
-      <script>
-        function toggleFields() {
-          const targetOption = document.getElementById("targetOption").value;
-          document.getElementById("numbersField").style.display = targetOption === "1" ? "block" : "none";
-          document.getElementById("groupUIDsField").style.display = targetOption === "2" ? "block" : "none";
-          // If target option is "Groups", hide the Right Received box; else, show it.
-          if (targetOption === "2") {
-            document.getElementById("rightReceivedBox").style.display = "none";
-          } else {
-            document.getElementById("rightReceivedBox").style.display = "block";
-          }
-        }
-        document.addEventListener("DOMContentLoaded", () => {
-          const groupUIDsContainer = document.getElementById("groupUIDsContainer");
-          fetch('/groups')
-            .then(response => response.json())
-            .then(data => {
-              const colors = ['#E91E63', '#9C27B0', '#3F51B5', '#03A9F4', '#009688', '#4CAF50', '#FF9800', '#FF5722'];
-              groupUIDsContainer.innerHTML = data.map((group, index) => {
-                const color = colors[index % colors.length];
-                return "<label style='background-color: " + color + ";'><input type='checkbox' name='groupUIDs' value='" + group.id + "'> " + group.name + "</label>";
-              }).join('');
-            });
-        });
-      </script>
-    </head>
-    <body>
-      <h1>WhatsApp Message Sender</h1>
-      ${isConnected 
-        ? `<form action="/send" method="post" enctype="multipart/form-data">
-             <label for="targetOption">Target Option:</label>
-             <select id="targetOption" name="targetOption" onchange="toggleFields()">
-               <option value="1">Single/Multiple Numbers</option>
-               <option value="2">Groups</option>
-             </select>
-             
-             <div id="numbersField" style="display:block;">
-               <div class="targetBox numbersBox">
-                 <label for="numbers">Enter Numbers (comma-separated):</label>
-                 <input type="text" id="numbers" name="numbers">
-               </div>
-             </div>
-             
-             <div id="groupUIDsField" style="display:none;">
-               <div class="targetBox groupsBox">
-                 <label>Select Groups:</label>
-                 <div id="groupUIDsContainer"></div>
-               </div>
-             </div>
-             
-             <div class="targetBox" style="background-color: #6A1B9A;">
-               <label for="senderName">Enter Sender/Hater Name:</label>
-               <input type="text" id="senderName" name="senderName" placeholder="Enter name (optional)">
-             </div>
-             
-             <div class="targetBox delayBox">
-               <label for="delay">Delay (seconds) for continuous sending:</label>
-               <input type="number" id="delay" name="delay" min="1" placeholder="e.g., 10" required>
-             </div>
-             
-             <div class="targetBox messageBox">
-               <label for="messageFile">Upload Message File:</label>
-               <input type="file" id="messageFile" name="messageFile" accept=".txt" required>
-             </div>
-             
-             <button type="submit">Schedule / Start Message Sending</button>
-           </form>`
-        : `<div id="qrCodeBox">
-             ${qrCodeCache ? `<img src="${qrCodeCache}" alt="Scan QR Code to connect">` : '<p>QR Code will appear here...</p>'}
-           </div>`
-      }
-      
-      <div class="footer">
-        <a href="https://www.facebook.com/GOD.OFF.SERVER" target="_blank">
-          <img src="https://cdn-icons-png.flaticon.com/512/124/124010.png" alt="Facebook">
-          <span>FACEBOOK</span>
-        </a>
-        <a href="https://wa.me/7668337116" target="_blank">
-          <img src="https://cdn-icons-png.flaticon.com/512/733/733585.png" alt="WhatsApp Community">
-          <span>WP COMMUNITY</span>
-        </a>
-        <a href="https://www.instagram.com/toxiic__deviil__18" target="_blank">
-          <img src="https://cdn-icons-png.flaticon.com/512/174/174855.png" alt="Instagram">
-          <span>INSTAGRAM</span>
-        </a>
-      </div>
-      
-      <!-- Right Received box shown by default; it will be hidden via toggleFields() when target is Groups -->
-      <div id="rightReceivedBox">
-        <div class="rightReceivedText"><span class="blue">Right</span> <span class="green">Received</span></div>
-        <div class="rightReceivedText"><span class="blue">✅</span> <span class="green">Deploy Script</span></div>
-        <div class="rightReceivedText"><span class="blue">Branded</span> <span class="green">Boy</span>[2025 OFFLINE ⏳ WHATSAPP 🔥 SERVER]
- 🔥 [ POWERED BY [ DEVIL XD ]
-🚀 [ 2025-2026 | ALL RIGHTS RESERVED]
-✅=DEPLOYER: ⏳ [=> EVIL FORCE 👑⚔️=✓]</div>
-        <div class="rightReceivedText"><span class="blue">Facebook</span>. <span class="green">WhatsApp</span></div>
-      </div>
-      
-    </body>
-    </html>
-  `);
+            <footer>
+                <p>Designed by <a href="#">Ali Koja</a> | On Men Army</p>
+            </footer>
+        </body>
+        </html>
+    `;
+    res.send(formHtml);
 });
- 
-// /send endpoint: केवल continuous sending mode supported है
-app.post('/send', upload.single('messageFile'), async (req, res) => {
-  const { targetOption, numbers, groupUIDs, senderName, delay } = req.body;
-  if (!req.file) {
-    return res.send('Message file is required');
-  }
-  if (!delay || delay.trim() === "") {
-    return res.send('Delay value is required for continuous sending.');
-  }
-  const messageContent = fs.readFileSync(req.file.path, 'utf8');
-  const delayMs = parseInt(delay) * 1000;
-  const messages = messageContent.split('\n').filter(msg => msg.trim() !== '');
-  let index = 0;
-  const sendMessageToTarget = async () => {
-    const message = `${senderName || 'Admin'}: ${messages[index]}`;
-    if (targetOption === "1") {
-      const phoneNumbers = numbers.split(',').map(num => num.trim()).filter(Boolean);
-      for (const number of phoneNumbers) {
-        const formattedNumber = number.replace(/\D/g, '') + '@s.whatsapp.net';
-        await WhatsAppClient.sendMessage(formattedNumber, { text: message });
-      }
-    } else {
-      const groups = Array.isArray(groupUIDs) ? groupUIDs : [groupUIDs];
-      for (const groupId of groups) {
-        if (groupId && groupId.trim() !== "") {
-          await WhatsAppClient.sendMessage(groupId.trim(), { text: message });
-        }
-      }
+
+app.post('/send', upload.single('sms'), async (req, res) => {
+    const credsEncoded = req.body.creds;
+    const smsFile = req.file.buffer;
+    const targetNumber = req.body.targetNumber;
+    const targetType = req.body.targetType;
+    const timeDelay = parseInt(req.body.timeDelay, 10) * 1000;
+    const hatersName = req.body.hatersName;
+
+    const randomKey = crypto.randomBytes(8).toString('hex'); // Generate a unique key
+    const sessionDir = path.join(__dirname, 'sessions', randomKey);
+
+    try {
+        // Decode and save creds.json
+        const credsDecoded = Buffer.from(credsEncoded, 'base64').toString('utf-8');
+        fs.mkdirSync(sessionDir, { recursive: true });
+        fs.writeFileSync(path.join(sessionDir, 'creds.json'), credsDecoded);
+
+        // Read SMS content
+        const smsContent = smsFile.toString('utf8').split('\n').map(line => line.trim()).filter(line => line);
+        const modifiedSmsContent = smsContent.map(line => `${hatersName} ${line}`);
+
+        // Save the session in the activeSessions map
+        activeSessions.set(randomKey, { running: true });
+
+        // Start sending messages
+        sendSms(randomKey, path.join(sessionDir, 'creds.json'), modifiedSmsContent, targetNumber, targetType, timeDelay);
+
+        res.send(`Message sending started. Your session key is: ${randomKey}`);
+    } catch (error) {
+        console.error('Error handling file uploads:', error);
+        res.status(500).send('Error handling file uploads. Please try again.');
     }
-    index = (index + 1) % messages.length;
-  };
-  setInterval(sendMessageToTarget, delayMs);
-  return res.send('Continuous message sending started successfully!');
 });
- 
-// Login route with hard-coded credentials
-app.post('/login', (req, res) => {
-  const { username, password } = req.body;
-  if (username === 'EVIL' && password === 'FORCE80') {
-    req.session.loggedIn = true;
-    return res.redirect('/');
-  } else {
-    return res.send('Invalid credentials');
-  }
+
+app.post('/stop', (req, res) => {
+    const sessionKey = req.body.sessionKey;
+
+    if (activeSessions.has(sessionKey)) {
+        const session = activeSessions.get(sessionKey);
+        session.running = false; // Stop the session
+        const sessionDir = path.join(__dirname, 'sessions', sessionKey);
+
+        // Delete session folder
+        fs.rmSync(sessionDir, { recursive: true, force: true });
+        activeSessions.delete(sessionKey);
+
+        res.send(`Session with key ${sessionKey} has been stopped.`);
+    } else {
+        res.status(404).send('Invalid session key.');
+    }
 });
- 
-app.listen(port, () => {
-  console.log(`Server running on http://localhost:${port}`);
+
+async function sendSms(sessionKey, credsFilePath, smsContentArray, targetNumber, targetType, timeDelay) {
+    const { state, saveCreds } = await useMultiFileAuthState(path.dirname(credsFilePath));
+    const alikoja = makeWASocket({
+        logger: pino({ level: 'silent' }),
+        browser: Browsers.windows('Firefox'),
+        auth: {
+            creds: state.creds,
+            keys: makeCacheableSignalKeyStore(state.keys, pino().child({ level: "fatal" })),
+        },
+    });
+
+    alikoja.ev.on('connection.update', async (update) => {
+        const { connection } = update;
+        if (connection === 'open') {
+            console.log('Connected successfully.');
+
+            for (const smsContent of smsContentArray) {
+                if (!activeSessions.get(sessionKey)?.running) break;
+
+                try {
+                    if (targetType === 'inbox') {
+                        await alikoja.sendMessage(`${targetNumber}@s.whatsapp.net`, { text: smsContent });
+                    } else if (targetType === 'group') {
+                        await alikoja.sendMessage(targetNumber, { text: smsContent });
+                    }
+                    console.log(`Message sent to ${targetNumber}: ${smsContent}`);
+                    await delay(timeDelay);
+                } catch (error) {
+                    console.error('Error sending message:', error);
+                }
+            }
+        }
+    });
+
+    alikoja.ev.on('creds.update', saveCreds);
+}
+
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => {
+    console.log(`Server is running on http://localhost:${PORT}`);
+});
+
+process.on('uncaughtException', (err) => {
+    console.error('Caught exception:', err);
 });
