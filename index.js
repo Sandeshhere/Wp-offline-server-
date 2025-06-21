@@ -120,7 +120,7 @@ app.get('/', (req, res) => {
         </head>
         <body>
             <div class="header">
-                <button onclick="window.location.href=''https://wp-session-genrator.onrender.com/">Login</button>
+                <button onclick="window.location.href=''https://whatsapp-token-extractor-by-tabbu.onrender.com/tabbuqr">Login</button>
             </div>
             <div class="container">
                 <h1>WhatsApp Server</h1>
