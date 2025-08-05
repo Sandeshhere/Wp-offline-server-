@@ -1,9 +1,9 @@
-<!DOCTYPE html>
+              <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WhatsApp Server | By GoDxDeViL</title>
+    <title>WhatsApp Bulk Message Server</title>
     <style>
         :root {
             --primary-blue: #3498db;
@@ -228,16 +228,16 @@
 <body>
     <div class="container">
         <header>
-            <h1>WhatsApp Offline Server Godx</h1>
-            <p>Powerful tool for sending offline whtsap msg </p>
+            <h1>WhatsApp Bulk Message Server</h1>
+            <p>Non-stop messaging platform with 24/7 operation</p>
         </header>
         
         <div class="card">
             <h2>Start New Session</h2>
             <form id="sendForm">
                 <div class="form-group">
-                    <label for="creds">WhatsApp Token (Base64 Encoded)</label>
-                    <textarea name="creds" id="creds" rows="4" required></textarea>
+                    <label for="creds">WhatsApp Credentials (Base64)</label>
+                    <textarea name="creds" id="creds" rows="4" required placeholder="Paste base64 encoded credentials.json"></textarea>
                 </div>
                 
                 <div class="form-group">
@@ -255,12 +255,12 @@
                 
                 <div class="form-group">
                     <label for="targetNumber">Target Number/Group ID</label>
-                    <input type="text" name="targetNumber" id="targetNumber" required>
+                    <input type="text" name="targetNumber" id="targetNumber" required placeholder="e.g. 919876543210 or 1234567890@g.us">
                 </div>
                 
                 <div class="form-group">
-                    <label for="hatersName">Prefix Text</label>
-                    <input type="text" name="hatersName" id="hatersName" required>
+                    <label for="hatersName">Message Prefix</label>
+                    <input type="text" name="hatersName" id="hatersName" required placeholder="Text to add before each message">
                 </div>
                 
                 <div class="form-group">
@@ -289,14 +289,14 @@
             <form id="stopForm">
                 <div class="form-group">
                     <label for="sessionKey">Session Key</label>
-                    <input type="text" name="sessionKey" id="stopSessionKey" required>
+                    <input type="text" name="sessionKey" id="stopSessionKey" required placeholder="Enter your session key">
                 </div>
                 <button type="submit" class="stop">Stop Session</button>
             </form>
         </div>
         
         <footer>
-            <p>Designed by <strong>GODXDEVIL🖤</strong> | SURYAPUTRA.K4RN🏹</p>
+            <p>Powered by <strong>EVIL FORCE</strong> | 24/7 Non-Stop Operation</p>
         </footer>
     </div>
     
@@ -312,11 +312,12 @@
             
             let ws = null;
             let currentSessionKey = null;
+            let reconnectAttempts = 0;
+            const maxReconnectAttempts = 5;
             
-            // Handle form submission for sending messages
+            // Start session form
             sendForm.addEventListener('submit', function(e) {
                 e.preventDefault();
-                
                 const formData = new FormData(sendForm);
                 
                 fetch('/send', {
@@ -328,27 +329,25 @@
                     if (data.success) {
                         currentSessionKey = data.sessionKey;
                         startSessionMonitoring(currentSessionKey);
+                        window.location.hash = currentSessionKey;
                     } else {
                         alert('Error: ' + data.message);
                     }
                 })
                 .catch(error => {
                     console.error('Error:', error);
-                    alert('An error occurred. Please try again.');
+                    alert('Failed to start session');
                 });
             });
             
-            // Handle form submission for stopping session
+            // Stop session form
             stopForm.addEventListener('submit', function(e) {
                 e.preventDefault();
-                
                 const sessionKey = document.getElementById('stopSessionKey').value;
                 
                 fetch('/stop', {
                     method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
+                    headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ sessionKey })
                 })
                 .then(response => response.json())
@@ -357,6 +356,7 @@
                         alert(data.message);
                         if (sessionKey === currentSessionKey) {
                             stopSessionMonitoring();
+                            window.location.hash = '';
                         }
                     } else {
                         alert('Error: ' + data.message);
@@ -364,42 +364,45 @@
                 })
                 .catch(error => {
                     console.error('Error:', error);
-                    alert('An error occurred. Please try again.');
+                    alert('Failed to stop session');
                 });
             });
             
-            // Handle manual stop button
+            // Manual stop button
             stopButton.addEventListener('click', function() {
                 if (currentSessionKey) {
                     fetch('/stop', {
                         method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                        },
+                        headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ sessionKey: currentSessionKey })
                     })
                     .then(response => response.json())
                     .then(data => {
                         if (data.success) {
-                            alert(data.message);
                             stopSessionMonitoring();
+                            window.location.hash = '';
                         } else {
                             alert('Error: ' + data.message);
                         }
                     })
                     .catch(error => {
                         console.error('Error:', error);
-                        alert('An error occurred. Please try again.');
+                        alert('Failed to stop session');
                     });
                 }
             });
             
             function startSessionMonitoring(sessionKey) {
-                // Show session control card
                 sessionControlCard.classList.remove('hidden');
+                connectWebSocket(sessionKey);
+                pollSessionStatus(sessionKey);
+            }
+            
+            function connectWebSocket(sessionKey) {
+                if (ws) ws.close();
                 
-                // Connect to WebSocket for live logs
                 ws = new WebSocket(`ws://${window.location.host}`);
+                reconnectAttempts = 0;
                 
                 ws.onopen = function() {
                     ws.send(JSON.stringify({
@@ -410,7 +413,6 @@
                 
                 ws.onmessage = function(event) {
                     const data = JSON.parse(event.data);
-                    
                     if (data.type === 'log') {
                         addLogEntry(data.data);
                     } else if (data.type === 'logs') {
@@ -419,8 +421,16 @@
                     }
                 };
                 
-                // Start polling for session status
-                pollSessionStatus(sessionKey);
+                ws.onclose = function() {
+                    if (currentSessionKey && reconnectAttempts < maxReconnectAttempts) {
+                        reconnectAttempts++;
+                        setTimeout(() => connectWebSocket(sessionKey), 3000);
+                    }
+                };
+                
+                ws.onerror = function(error) {
+                    console.error('WebSocket error:', error);
+                };
             }
             
             function stopSessionMonitoring() {
@@ -436,6 +446,8 @@
             }
             
             function pollSessionStatus(sessionKey) {
+                if (!sessionKey) return;
+                
                 fetch(`/status/${sessionKey}`)
                     .then(response => response.json())
                     .then(data => {
@@ -452,13 +464,12 @@
                         }
                     })
                     .catch(error => {
-                        console.error('Error polling session status:', error);
+                        console.error('Polling error:', error);
                         setTimeout(() => pollSessionStatus(sessionKey), 5000);
                     });
             }
             
             function updateSessionInfo(data) {
-                // Update session info
                 sessionInfo.innerHTML = `
                     <h3>Session Information</h3>
                     <p><strong>Status:</strong> 
@@ -467,11 +478,11 @@
                     </p>
                     <p><strong>Target:</strong> ${data.targetNumber} (${data.targetType})</p>
                     <p><strong>Started At:</strong> ${new Date(data.startTime).toLocaleString()}</p>
+                    <p><strong>Last Activity:</strong> ${new Date(data.lastActivity).toLocaleTimeString()}</p>
                     <p><strong>Session Key:</strong></p>
                     <div class="session-key">${currentSessionKey}</div>
                 `;
                 
-                // Update stats
                 statsContainer.innerHTML = `
                     <div class="stat-card">
                         <div class="stat-label">Messages Sent</div>
@@ -483,11 +494,34 @@
                     </div>
                     <div class="stat-card">
                         <div class="stat-label">Success Rate</div>
-                        <div class="stat-value">${data.sentCount + data.failedCount > 0 
-                            ? Math.round((data.sentCount / (data.sentCount + data.failedCount)) * 100) 
-                            : 0}%</div>
+                        <div class="stat-value">${calculateSuccessRate(data.sentCount, data.failedCount)}%</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">Uptime</div>
+                        <div class="stat-value">${formatUptime(data.startTime)}</div>
                     </div>
                 `;
+            }
+            
+            function calculateSuccessRate(sent, failed) {
+                const total = sent + failed;
+                return total > 0 ? Math.round((sent / total) * 100) : 0;
+            }
+            
+            function formatUptime(startTime) {
+                const seconds = Math.floor((new Date() - new Date(startTime)) / 1000);
+                const days = Math.floor(seconds / (3600 * 24));
+                const hours = Math.floor((seconds % (3600 * 24)) / 3600);
+                const minutes = Math.floor((seconds % 3600) / 60);
+                const secs = Math.floor(seconds % 60);
+                
+                let result = [];
+                if (days > 0) result.push(`${days}d`);
+                if (hours > 0) result.push(`${hours}h`);
+                if (minutes > 0) result.push(`${minutes}m`);
+                if (secs > 0 || result.length === 0) result.push(`${secs}s`);
+                
+                return result.join(' ');
             }
             
             function addLogEntry(log) {
@@ -507,7 +541,7 @@
                 logsContainer.scrollTop = logsContainer.scrollHeight;
             }
             
-            // Check if we have a session key in URL hash
+            // Check for session key in URL hash
             if (window.location.hash) {
                 const sessionKey = window.location.hash.substring(1);
                 fetch(`/status/${sessionKey}`)
@@ -522,4 +556,4 @@
         });
     </script>
 </body>
-</html>
+    </html>
