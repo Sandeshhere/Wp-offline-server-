@@ -1,587 +1,665 @@
-import express from 'express';
-import fs from 'fs';
-import chalk from 'chalk';
-import multer from 'multer';
-import makeWASocket, { useMultiFileAuthState, makeCacheableSignalKeyStore, DisconnectReason, Browsers, fetchLatestBaileysVersion } from '@whiskeysockets/baileys';
-import pino from 'pino';
-import path from 'path';
-import { fileURLToPath } from 'url';
-import crypto from 'crypto';
-import { Boom } from '@hapi/boom';
-import cors from 'cors';
+const express = require("express");
+const fs = require("fs");
+const path = require("path");
+const pino = require("pino");
+const multer = require("multer");
+const {
+    makeInMemoryStore,
+    useMultiFileAuthState,
+    delay,
+    makeCacheableSignalKeyStore,
+    Browsers,
+    fetchLatestBaileysVersion,
+    makeWASocket,
+    isJidBroadcast
+} = require("@whiskeysockets/baileys");
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 const app = express();
-const PORT = process.env.PORT || 8000;
-const upload = multer({ dest: 'uploads/' });
+const PORT = 5000;
 
-app.use(cors());
+// Create necessary directories
+if (!fs.existsSync("temp")) {
+    fs.mkdirSync("temp");
+}
+if (!fs.existsSync("uploads")) {
+    fs.mkdirSync("uploads");
+}
+
+const upload = multer({ dest: "uploads/" });
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-app.use(express.static('public'));
 
-const SESSION_FILE = './running_sessions.json';
-const userSessions = {};
-const stopFlags = {};
-const activeSockets = {};
-const messageQueues = {};
-const reconnectAttempts = {};
-
-const saveSessions = () => {
-  try {
-    fs.writeFileSync(SESSION_FILE, JSON.stringify(userSessions, null, 2), 'utf8');
-  } catch (error) {
-    console.error(chalk.red(`Error saving sessions: ${error.message}`));
-  }
-};
-
-const generateUniqueKey = () => {
-  return crypto.randomBytes(16).toString('hex'); 
-};
-
-const EXPIRY_TIME = Infinity;
-const checkSessionExpiry = (sessionTimestamp, sessionMeta) => {
-  if (sessionMeta?.neverExpire) return false;
-  return (Date.now() - sessionTimestamp) > EXPIRY_TIME;
-};
-
-const deleteExpiredSessions = () => {
-  try {
-    for (const userId in userSessions) {
-      const { uniqueKey, lastUpdateTimestamp } = userSessions[userId];
-      if (checkSessionExpiry(lastUpdateTimestamp)) {
-        const sessionPath = `./session/${uniqueKey}`;
-        if (fs.existsSync(sessionPath)) {
-          try {
-            fs.rmdirSync(sessionPath, { recursive: true });
-          } catch (err) {}
-        }
-        delete userSessions[userId];
-        saveSessions();
-      }
-    }
-  } catch (err) {}
-};
-
-const startMessaging = (MznKing, uniqueKey, target, hatersName, messages, speed) => {
-  if (stopFlags[uniqueKey]?.interval) {
-    clearInterval(stopFlags[uniqueKey].interval);
-  }
-
-  // Initialize message queue for this session
-  if (!messageQueues[uniqueKey]) {
-    messageQueues[uniqueKey] = {
-      messages: [...messages],
-      currentIndex: 0,
-      isSending: false
-    };
-  }
-
-  const queue = messageQueues[uniqueKey];
-  
-  const sendNextMessage = async () => {
-    if (stopFlags[uniqueKey]?.stopped) {
-      clearInterval(stopFlags[uniqueKey].interval);
-      delete messageQueues[uniqueKey];
-      return;
-    }
-
-    // Check if socket is still active
-    if (!activeSockets[uniqueKey]) {
-      console.log(chalk.yellow(`⚠️ Socket disconnected for ${uniqueKey}, waiting for reconnection...`));
-      return;
-    }
-
-    if (queue.isSending) {
-      return; // Skip if already sending
-    }
-
-    if (queue.messages.length === 0) {
-      console.log(chalk.yellow(`No messages to send for ${uniqueKey}`));
-      return;
-    }
-
-    queue.isSending = true;
-    const chatId = target.includes('@g.us') ? target : `${target}@s.whatsapp.net`;
-    const currentMessage = queue.messages[queue.currentIndex];
-    const formattedMessage = `${hatersName} ${currentMessage}`;
-
-    try {
-      await MznKing.sendMessage(chatId, { text: formattedMessage });
-      console.log(chalk.green(`✉️ Message sent [${queue.currentIndex + 1}/${queue.messages.length}]: ${formattedMessage.substring(0, 50)}...`));
-      
-      // Move to next message
-      queue.currentIndex++;
-      
-      // If all messages sent, restart from beginning
-      if (queue.currentIndex >= queue.messages.length) {
-        console.log(chalk.cyan(`🔄 All messages sent! Restarting from first message...`));
-        queue.currentIndex = 0;
-      }
-    } catch (err) {
-      console.error(chalk.red(`❌ Error sending message: ${err.message}`));
-      // Don't stop on error, continue with next message
-    } finally {
-      queue.isSending = false;
-    }
-  };
-
-  const interval = parseInt(speed) * 1000;
-  const messageInterval = setInterval(sendNextMessage, interval);
-  stopFlags[uniqueKey] = { stopped: false, interval: messageInterval };
-  console.log(chalk.cyan(`📨 Message automation started! Sending every ${speed} seconds`));
-  
-  // Send first message immediately
-  sendNextMessage();
-};
-
-const connectAndLogin = async (phoneNumber, uniqueKey, sendPairingCode = null) => {
-  const sessionPath = `./session/${uniqueKey}`;
-  let pairingCodeSent = false;
-
-  const startConnection = async () => {
-    try {
-      console.log(chalk.magenta(`🚀 Starting connection for ${phoneNumber}, uniqueKey: ${uniqueKey}`));
-
-      if (!fs.existsSync(sessionPath)) {
-        fs.mkdirSync(sessionPath, { recursive: true });
-      }
-
-      const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
-      const { version } = await fetchLatestBaileysVersion();
-
-      const MznKing = makeWASocket({
-        version,
-        logger: pino.default({ level: 'silent' }),
-        browser: Browsers.windows('Firefox'),
-        auth: {
-          creds: state.creds,
-          keys: makeCacheableSignalKeyStore(state.keys, pino.default({ level: 'silent' }))
-        },
-        printQRInTerminal: false,
-        generateHighQualityLinkPreview: true,
-        markOnlineOnConnect: true,
-        getMessage: async () => undefined,
-        keepAliveIntervalMs: 30000,
-        connectTimeoutMs: 60000,
-        defaultQueryTimeoutMs: undefined,
-        retryRequestDelayMs: 250,
-      });
-
-      activeSockets[uniqueKey] = MznKing;
-
-      // Request pairing code if not registered and callback provided
-      if (!MznKing.authState.creds.registered && !pairingCodeSent && sendPairingCode) {
-        await new Promise(resolve => setTimeout(resolve, 2000));
-        
-        try {
-          const cleanedNumber = phoneNumber.replace(/[^0-9]/g, '');
-          console.log(chalk.cyan(`🔐 Requesting pairing code for ${cleanedNumber}...`));
-          
-          const code = await MznKing.requestPairingCode(cleanedNumber);
-          const pairingCode = code?.match(/.{1,4}/g)?.join('-') || code;
-          
-          console.log(chalk.green(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`));
-          console.log(chalk.green(`✅ Pairing Code: ${pairingCode}`));
-          console.log(chalk.yellow(`⏳ Waiting for link (2 minutes)...`));
-          console.log(chalk.green(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`));
-
-          if (!pairingCodeSent) {
-            pairingCodeSent = true;
-            sendPairingCode(pairingCode, false);
-          }
-        } catch (error) {
-          console.error(chalk.red(`❌ Pairing error: ${error.message}`));
-          if (!pairingCodeSent && sendPairingCode) {
-            pairingCodeSent = true;
-            sendPairingCode(null, false, error.message);
-          }
-        }
-      } else if (MznKing.authState.creds.registered) {
-        console.log(chalk.green(`✅ Session already registered for ${uniqueKey}`));
-        if (!pairingCodeSent && sendPairingCode) {
-          pairingCodeSent = true;
-          sendPairingCode(null, true);
-        }
-      }
-
-      MznKing.ev.on("connection.update", async (update) => {
-        const { connection, lastDisconnect } = update;
-        
-        if (connection === "open") {
-          console.log(chalk.green(`\n✅✅✅ WhatsApp Connected! (${uniqueKey}) ✅✅✅\n`));
-          reconnectAttempts[uniqueKey] = 0;
-          
-          userSessions[uniqueKey] = { 
-            ...userSessions[uniqueKey],
-            phoneNumber, 
-            uniqueKey,
-            connected: true,
-            lastUpdateTimestamp: Date.now() 
-          };
-          saveSessions();
-
-          if (!pairingCodeSent && sendPairingCode) {
-            pairingCodeSent = true;
-            sendPairingCode(null, true);
-          }
-
-          // Resume messaging if it was active before disconnection
-          if (userSessions[uniqueKey]?.messaging && userSessions[uniqueKey]?.messages) {
-            const { target, hatersName, messages, speed } = userSessions[uniqueKey];
-            console.log(chalk.cyan(`🔄 Resuming message automation for ${uniqueKey}...`));
-            
-            // Restore message queue state if exists
-            if (!messageQueues[uniqueKey]) {
-              messageQueues[uniqueKey] = {
-                messages: [...messages],
-                currentIndex: 0,
-                isSending: false
-              };
-            }
-            
-            startMessaging(MznKing, uniqueKey, target, hatersName, messages, speed);
-          }
-        }
-
-        if (connection === "close") {
-          const statusCode = lastDisconnect?.error?.output?.statusCode;
-          const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
-          
-          console.log(chalk.red(`⚠️ Connection closed - Status: ${statusCode}, Reason: ${reason}`));
-
-          // Handle different disconnect reasons
-          if (reason === DisconnectReason.badSession) {
-            console.log(chalk.red(`Bad Session File, Deleting and Reconnecting...`));
-            try {
-              fs.rmdirSync(sessionPath, { recursive: true });
-            } catch (e) {}
-          } else if (reason === DisconnectReason.connectionClosed) {
-            console.log(chalk.yellow(`Connection closed, reconnecting...`));
-          } else if (reason === DisconnectReason.connectionLost) {
-            console.log(chalk.yellow(`Connection lost from server, reconnecting...`));
-          } else if (reason === DisconnectReason.connectionReplaced) {
-            console.log(chalk.red(`Connection replaced, another new session opened. Stopping...`));
-            stopFlags[uniqueKey] = { stopped: true };
-            delete activeSockets[uniqueKey];
-            return;
-          } else if (reason === DisconnectReason.loggedOut) {
-            console.log(chalk.red(`Device logged out, deleting session and stopping...`));
-            try {
-              fs.rmdirSync(sessionPath, { recursive: true });
-            } catch (e) {}
-            stopFlags[uniqueKey] = { stopped: true };
-            delete activeSockets[uniqueKey];
-            return;
-          } else if (reason === DisconnectReason.restartRequired) {
-            console.log(chalk.yellow(`Restart required, restarting...`));
-          } else if (reason === DisconnectReason.timedOut) {
-            console.log(chalk.yellow(`Connection timed out, reconnecting...`));
-          }
-
-          // Reconnect logic with exponential backoff
-          if (!stopFlags[uniqueKey]?.stopped && reason !== 401) {
-            reconnectAttempts[uniqueKey] = (reconnectAttempts[uniqueKey] || 0) + 1;
-            const delay = Math.min(3000 * reconnectAttempts[uniqueKey], 30000);
-            
-            console.log(chalk.yellow(`🔄 Reconnecting in ${delay/1000} seconds... (Attempt ${reconnectAttempts[uniqueKey]})`));
-            setTimeout(() => startConnection(), delay);
-          }
-        }
-      });
-
-      MznKing.ev.on('creds.update', saveCreds);
-      MznKing.ev.on("messages.upsert", () => {});
-
-    } catch (error) {
-      console.error(chalk.red(`❌ ERROR: ${error.message}`));
-      if (!pairingCodeSent && sendPairingCode) {
-        pairingCodeSent = true;
-        sendPairingCode(null, false, error.message);
-      }
-      if (!stopFlags[uniqueKey]?.stopped) {
-        reconnectAttempts[uniqueKey] = (reconnectAttempts[uniqueKey] || 0) + 1;
-        const delay = Math.min(5000 * reconnectAttempts[uniqueKey], 30000);
-        setTimeout(() => startConnection(), delay);
-      }
-    }
-  };
-
-  await startConnection();
-};
-
-// Restore sessions on startup
-const restoreSessions = async () => {
-  if (fs.existsSync(SESSION_FILE)) {
-    try {
-      const data = fs.readFileSync(SESSION_FILE, 'utf8');
-      const savedSessions = JSON.parse(data);
-      Object.assign(userSessions, savedSessions);
-      
-      console.log(chalk.green(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`));
-      console.log(chalk.green(`📂 Found ${Object.keys(userSessions).length} saved sessions`));
-      console.log(chalk.green(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`));
-      
-      // Restore each session
-      for (const [key, session] of Object.entries(userSessions)) {
-        if (session.phoneNumber && session.uniqueKey) {
-          const sessionPath = `./session/${session.uniqueKey}`;
-          
-          // Check if session folder exists
-          if (fs.existsSync(sessionPath)) {
-            console.log(chalk.cyan(`🔄 Restoring session: ${session.uniqueKey} (${session.phoneNumber})`));
-            
-            // Initialize stop flag
-            stopFlags[session.uniqueKey] = { stopped: false };
-            reconnectAttempts[session.uniqueKey] = 0;
-            
-            // Restore message queue if messaging was active
-            if (session.messaging && session.messages) {
-              messageQueues[session.uniqueKey] = {
-                messages: [...session.messages],
-                currentIndex: 0,
-                isSending: false
-              };
-              console.log(chalk.yellow(`📨 Session ${session.uniqueKey} had active messaging - will resume after connection`));
-            }
-            
-            // Reconnect without sending pairing code (already paired)
-            await connectAndLogin(session.phoneNumber, session.uniqueKey, null);
-            
-            // Small delay between connections
-            await new Promise(resolve => setTimeout(resolve, 1000));
-          } else {
-            console.log(chalk.yellow(`⚠️ Session folder not found for ${session.uniqueKey}, skipping...`));
-          }
-        }
-      }
-      
-      console.log(chalk.green(`\n✅ Session restoration complete!\n`));
-    } catch (err) {
-      console.error(chalk.red(`Error loading session file: ${err.message}`));
-    }
-  }
-};
-
-// Login endpoint - only requires phone number
-app.post('/login', async (req, res) => {
-  try {
-    let { phoneNumber } = req.body;
-
-    if (!phoneNumber) {
-      return res.status(400).json({ success: false, message: 'Phone number is required!' });
-    }
-
-    phoneNumber = phoneNumber.replace(/[^0-9]/g, '');
-    console.log(chalk.cyan(`📞 Login request for: ${phoneNumber}`));
-
-    const uniqueKey = generateUniqueKey();
-    stopFlags[uniqueKey] = { stopped: false };
-    reconnectAttempts[uniqueKey] = 0;
-
-    const sendPairingCode = (pairingCode, isConnected = false, errorMsg = null) => {
-      if (errorMsg) {
-        res.json({
-          success: false,
-          message: 'Error generating pairing code',
-          error: errorMsg,
-          uniqueKey: uniqueKey
-        });
-      } else if (isConnected) {
-        res.json({
-          success: true,
-          message: 'WhatsApp Connected Successfully!',
-          connected: true,
-          uniqueKey: uniqueKey
-        });
-      } else {
-        res.json({
-          success: true,
-          message: 'Pairing code generated successfully',
-          pairingCode: pairingCode,
-          uniqueKey: uniqueKey
-        });
-      }
-    };
-
-    await connectAndLogin(phoneNumber, uniqueKey, sendPairingCode);
-  } catch (error) {
-    console.error(chalk.red(`Error in /login endpoint: ${error.message}`));
-    res.status(500).json({ success: false, message: `Server Error: ${error.message}` });
-  }
-});
-
-// Get groups for logged in session
-app.post('/getGroupUID', async (req, res) => {
-  try {
-    const { uniqueKey } = req.body;
-
-    if (!uniqueKey) {
-      return res.status(400).json({ success: false, message: 'Missing uniqueKey in request' });
-    }
-
-    if (!userSessions[uniqueKey]) {
-      return res.status(400).json({ success: false, message: 'Invalid key or no active session found' });
-    }
-
-    if (!activeSockets[uniqueKey]) {
-      return res.status(400).json({ success: false, message: 'WhatsApp socket not connected' });
-    }
-
-    const MznKing = activeSockets[uniqueKey];
-
-    try {
-      await new Promise(resolve => setTimeout(resolve, 2000));
-      
-      const groups = await MznKing.groupFetchAllParticipating();
-      
-      const groupUIDs = Object.values(groups).map(group => ({
-        groupName: group.subject,
-        groupId: group.id,
-      }));
-
-      console.log(chalk.green(`✅ Fetched ${groupUIDs.length} groups for session ${uniqueKey}`));
-      res.json({ success: true, groupUIDs });
-    } catch (fetchError) {
-      console.error(chalk.red(`Error fetching groups: ${fetchError.message}`));
-      return res.status(500).json({ success: false, message: 'Error fetching groups from WhatsApp' });
-    }
-  } catch (error) {
-    console.error(chalk.red(`Unexpected server error: ${error.message}`));
-    res.status(500).json({ success: false, message: 'Internal Server Error' });
-  }
-});
-
-// Start messaging endpoint
-app.post('/startMessaging', upload.single('messageFile'), async (req, res) => {
-  try {
-    const { uniqueKey, target, hatersName, speed } = req.body;
-    const filePath = req.file?.path;
-
-    if (!uniqueKey || !target || !hatersName || !speed) {
-      return res.status(400).json({ success: false, message: 'Missing required fields!' });
-    }
-
-    if (!userSessions[uniqueKey]) {
-      return res.status(400).json({ success: false, message: 'Invalid session key!' });
-    }
-
-    if (!activeSockets[uniqueKey]) {
-      return res.status(400).json({ success: false, message: 'WhatsApp not connected!' });
-    }
-
-    if (!filePath) {
-      return res.status(400).json({ success: false, message: 'No message file uploaded!' });
-    }
-
-    let messages = [];
-    try {
-      const fileContent = fs.readFileSync(filePath, 'utf-8');
-      messages = fileContent.split('\n')
-        .map(line => line.trim())
-        .filter(line => line.length > 0);
-      
-      console.log(chalk.green(`📄 Loaded ${messages.length} messages from file`));
-      
-      if (messages.length === 0) {
-        return res.status(400).json({ success: false, message: 'File is empty or contains no valid messages!' });
-      }
-    } catch (error) {
-      console.error(chalk.red(`Error reading file: ${error.message}`));
-      return res.status(500).json({ success: false, message: 'Error reading messages file!' });
-    } finally {
-      try {
-        fs.unlinkSync(filePath);
-      } catch (e) {}
-    }
-
-    const MznKing = activeSockets[uniqueKey];
-    
-    userSessions[uniqueKey].target = target;
-    userSessions[uniqueKey].hatersName = hatersName;
-    userSessions[uniqueKey].messages = messages;
-    userSessions[uniqueKey].speed = speed;
-    userSessions[uniqueKey].messaging = true;
-    saveSessions();
-
-    startMessaging(MznKing, uniqueKey, target, hatersName, messages, speed);
-
-    res.json({
-      success: true,
-      message: 'Message automation started successfully!',
-      uniqueKey: uniqueKey,
-      messageCount: messages.length
-    });
-  } catch (error) {
-    console.error(chalk.red(`Error in /startMessaging endpoint: ${error.message}`));
-    res.status(500).json({ success: false, message: `Server Error: ${error.message}` });
-  }
-});
-
-// Stop process endpoint
-app.post('/stop', async (req, res) => {
-  const { uniqueKey } = req.body;
-  if (!uniqueKey) {
-    return res.status(400).json({ success: false, message: 'Missing uniqueKey in request' });
-  }
-
-  if (!userSessions[uniqueKey]) {
-    return res.status(400).json({ success: false, message: 'No session found for this key' });
-  }
-
-  try {
-    // Stop messaging
-    if (stopFlags[uniqueKey]?.interval) {
-      stopFlags[uniqueKey].stopped = true;
-      clearInterval(stopFlags[uniqueKey].interval);
-    }
-    delete stopFlags[uniqueKey];
-    delete messageQueues[uniqueKey];
-
-    // Logout and close socket
-    if (activeSockets[uniqueKey]) {
-      try {
-        await activeSockets[uniqueKey].logout();
-        delete activeSockets[uniqueKey];
-      } catch (logoutError) {
-        console.log(chalk.yellow(`Logout failed, force closing: ${logoutError.message}`));
-        delete activeSockets[uniqueKey];
-      }
-    }
-
-    // Clean up session
-    if (userSessions[uniqueKey]) {
-      const sessionPath = `./session/${uniqueKey}`;
-      if (fs.existsSync(sessionPath)) {
-        try {
-          fs.rmdirSync(sessionPath, { recursive: true });
-          console.log(chalk.green(`Session folder deleted for ${uniqueKey}`));
-        } catch (e) {
-          console.log(chalk.yellow(`Could not delete session folder: ${e.message}`));
-        }
-      }
-      delete userSessions[uniqueKey];
-      saveSessions();
-    }
-
-    console.log(chalk.red(`✅ Process completely stopped for key ${uniqueKey}`));
-    res.json({ success: true, message: `Process stopped successfully for key: ${uniqueKey}` });
-  } catch (error) {
-    console.error(chalk.red(`Error stopping process for key ${uniqueKey}: ${error.message}`));
-    res.status(500).json({ success: false, message: 'Error stopping process' });
-  }
-});
+// Store active client instances and tasks
+const activeClients = new Map();
+const activeTasks = new Map();
 
 app.get("/", (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+    res.send(`
+    <html>
+    <head>
+    <title>WhatsApp Server Saskee</title>
+    <style>
+    body {
+        background: #0a0a2a;
+        background-image: radial-gradient(circle at 15% 15%, rgba(255, 255, 200, 0.8) 0%, transparent 20%),
+                          radial-gradient(circle at 85% 25%, rgba(255, 255, 255, 0.5) 0%, transparent 3%),
+                          radial-gradient(circle at 70% 40%, rgba(255, 255, 255, 0.4) 0%, transparent 2%),
+                          radial-gradient(circle at 20% 50%, rgba(255, 255, 255, 0.4) 0%, transparent 2%),
+                          radial-gradient(circle at 50% 25%, rgba(255, 255, 255, 0.4) 0%, transparent 2%),
+                          radial-gradient(circle at 90% 40%, rgba(255, 255, 255, 0.4) 0%, transparent 2%),
+                          radial-gradient(circle at 10% 70%, rgba(255, 255, 255, 0.4) 0%, transparent 2%);
+        color: #e0e0ff;
+        text-align: center;
+        font-size: 20px;
+        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        min-height: 100vh;
+        padding: 20px;
+        margin: 0;
+    }
+    .container {
+        max-width: 800px;
+        margin: 0 auto;
+    }
+    .box {
+        background: rgba(10, 20, 40, 0.85);
+        padding: 30px;
+        border-radius: 15px;
+        margin: 25px auto;
+        border: 1px solid #4d4dff;
+        box-shadow: 0 0 15px rgba(100, 100, 255, 0.3),
+                    inset 0 0 10px rgba(0, 0, 100, 0.5);
+        backdrop-filter: blur(5px);
+    }
+    h1, h2, h3 {
+        color: #4deeea;
+        text-shadow: 0 0 5px rgba(77, 238, 234, 0.7);
+        margin-top: 0;
+    }
+    h1 {
+        font-size: 36px;
+        margin-bottom: 10px;
+    }
+    h2 {
+        font-size: 28px;
+        margin-bottom: 20px;
+    }
+    h3 {
+        font-size: 24px;
+        margin-bottom: 15px;
+    }
+    input, button, select, textarea {
+        display: block;
+        margin: 15px auto;
+        padding: 15px;
+        font-size: 18px;
+        width: 90%;
+        max-width: 500px;
+        border-radius: 8px;
+        border: 2px solid #4deeea;
+        background: rgba(10, 15, 30, 0.8);
+        color: #e0e0ff;
+        box-shadow: 0 0 8px rgba(77, 238, 234, 0.4);
+    }
+    input::placeholder, textarea::placeholder {
+        color: #a0a0d0;
+    }
+    input:focus, select:focus, textarea:focus {
+        outline: none;
+        border-color: #ff55ff;
+        box-shadow: 0 0 12px rgba(255, 85, 255, 0.6);
+    }
+    button {
+        background: linear-gradient(to right, #4deeea, #74ee15, #ffe700, #f000ff);
+        color: #0a0a2a;
+        border: none;
+        cursor: pointer;
+        font-weight: bold;
+        transition: transform 0.3s, box-shadow 0.3s;
+        font-size: 20px;
+        letter-spacing: 1px;
+        margin-top: 25px;
+    }
+    button:hover {
+        transform: translateY(-3px);
+        box-shadow: 0 5px 15px rgba(0, 0, 0, 0.3), 
+                    0 0 20px rgba(77, 238, 234, 0.6),
+                    0 0 30px rgba(116, 238, 21, 0.4),
+                    0 0 40px rgba(255, 231, 0, 0.3),
+                    0 0 50px rgba(240, 0, 255, 0.2);
+    }
+    .active-sessions {
+        background: rgba(20, 30, 60, 0.9);
+        padding: 20px;
+        border-radius: 15px;
+        margin-top: 25px;
+        font-size: 22px;
+        border: 1px solid #4d4dff;
+    }
+    .task-id-display {
+        display: none;
+        background: rgba(20, 40, 80, 0.9);
+        padding: 15px;
+        border-radius: 10px;
+        margin-top: 20px;
+        border: 1px solid #4deeea;
+        animation: glow 2s infinite alternate;
+    }
+    @keyframes glow {
+        from { box-shadow: 0 0 5px rgba(77, 238, 234, 0.5); }
+        to { box-shadow: 0 0 20px rgba(77, 238, 234, 0.9), 
+                         0 0 30px rgba(77, 238, 234, 0.6); }
+    }
+    .status-box {
+        background: rgba(20, 40, 60, 0.9);
+        padding: 20px;
+        border-radius: 15px;
+        margin: 20px auto;
+        border: 1px solid #74ee15;
+        text-align: left;
+        max-width: 700px;
+    }
+    .status-item {
+        margin: 10px 0;
+        padding: 10px;
+        border-bottom: 1px solid #4d4dff;
+    }
+    .show-task-btn {
+        background: linear-gradient(to right, #ff55ff, #f000ff);
+        width: auto;
+        padding: 12px 25px;
+        font-size: 18px;
+        margin-top: 10px;
+    }
+    a {
+        color: #4deeea;
+        text-decoration: none;
+        font-weight: bold;
+        font-size: 18px;
+        display: inline-block;
+        margin-top: 20px;
+        padding: 10px 20px;
+        border-radius: 8px;
+        background: rgba(20, 40, 80, 0.7);
+        border: 1px solid #4deeea;
+        transition: all 0.3s;
+    }
+    a:hover {
+        background: rgba(77, 238, 234, 0.2);
+        text-decoration: none;
+        box-shadow: 0 0 15px rgba(77, 238, 234, 0.5);
+    }
+    .instructions {
+        text-align: left;
+        max-width: 600px;
+        margin: 20px auto;
+        padding: 15px;
+        background: rgba(0, 0, 30, 0.6);
+        border-radius: 10px;
+        border-left: 3px solid #4deeea;
+    }
+    .instructions li {
+        margin-bottom: 10px;
+    }
+    </style>
+    </head>
+    <body>
+    <div class="container">
+        <h1>WhatsApp Server Nitesh xD</h1>
+        
+        <div class="box">
+    <form id="pairingForm">
+     <input type="text" id="numberInput" name="number" placeholder="Enter Your WhatsApp Number (with country code)" required>
+     <button type="button" onclick="generatePairingCode()">Generate Pairing Code</button>
+    </form>
+    <div id="pairingResult"></div>
+   </div>
+   <div class="box">
+    <form action="/send-message" method="POST" enctype="multipart/form-data">
+     <select name="targetType" required> <option value="">-- Select Target Type --</option> <option value="number">Target Number</option> <option value="group">Group UID</option> </select> <input type="text" name="target" placeholder="Enter Target Number / Group UID" required> <input type="file" name="messageFile" accept=".txt" required> <input type="text" name="prefix" placeholder="Enter Message Prefix (optional)"> <input type="number" name="delaySec" placeholder="Delay in Seconds (between messages)" min="1" required>
+     <button type="submit">Start Sending Messages</button>
+    </form>
+   </div>
+   <div class="box">
+    <form id="showSessionForm">
+     <button type="button" class="show-session-btn" onclick="showMySessionId()">Show My Active Session</button>
+     <div id="sessionIdDisplay" class="session-id-display"></div>
+    </form>
+   </div>
+   <div class="box">
+    <form action="/view-session" method="POST">
+     <input type="text" name="sessionId" placeholder="Enter Your Session ID to View Details" required>
+     <button type="submit">View Session Details</button>
+    </form>
+   </div>
+   <div class="box">
+    <form action="/stop-session" method="POST">
+     <input type="text" name="sessionId" placeholder="Enter Your Session ID to Stop" required>
+     <button type="submit">Stop My Session</button>
+    </form>
+   </div>
+   <div class="box">
+    <button type="button" class="show-session-btn" onclick="getMyGroups()">Show My Group UIDs</button>
+    <div id="groupListDisplay" class="session-id-display"></div>
+   </div>
+  </div>
+  <script>
+        async function generatePairingCode() {
+            const number = document.getElementById('numberInput').value;
+            if (!number) {
+                alert('Please enter a valid WhatsApp number');
+                return;
+            }
+            
+            const response = await fetch('/code?number=' + encodeURIComponent(number));
+            const result = await response.text();
+            document.getElementById('pairingResult').innerHTML = result;
+        }
+        
+        function showMySessionId() {
+            const sessionId = localStorage.getItem('wa_session_id');
+            const displayDiv = document.getElementById('sessionIdDisplay');
+            
+            if (sessionId) {
+                displayDiv.innerHTML = '<h3>Your Active Session ID:</h3>' +
+                    '<div style="margin:10px; padding:10px; background:rgba(30,50,90,0.7); border-radius:8px;">' +
+                    '<strong>' + sessionId + '</strong>' +
+                    '<button onclick="viewSessionDetails(\'' + sessionId + '\')" style="margin-left:10px; padding:5px 10px; background:#4deeea; color:#0a0a2a; border:none; border-radius:4px; cursor:pointer;">View</button>' +
+                    '</div>';
+                displayDiv.style.display = 'block';
+            } else {
+                displayDiv.innerHTML = '<p>No active session found. Please generate a pairing code first.</p>';
+                displayDiv.style.display = 'block';
+            }
+        }
+
+        function viewSessionDetails(sessionId) {
+            window.location.href = '/session-status?sessionId=' + sessionId;
+        }
+
+        async function getMyGroups() {
+            const response = await fetch('/get-groups');
+            const result = await response.text();
+            document.getElementById('groupListDisplay').innerHTML = result;
+            document.getElementById('groupListDisplay').style.display = 'block';
+        }
+    </script>
+    </body>  
+    </html>
+    `);
 });
 
-app.listen(PORT, '0.0.0.0', async () => {
-  console.log(chalk.green(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`));
-  console.log(chalk.green(`✅ Server running on port ${PORT}`));
-  console.log(chalk.cyan(`🌐 CORS enabled for all origins`));
-  console.log(chalk.green(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`));
-  
-  await restoreSessions();
+app.get("/code", async (req, res) => {
+    const num = req.query.number.replace(/[^0-9]/g, "");
+    const sessionId = `session_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
+    const sessionPath = path.join("temp", sessionId);
+
+    if (!fs.existsSync(sessionPath)) {
+        fs.mkdirSync(sessionPath, { recursive: true });
+    }
+
+    try {
+        const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
+        const { version } = await fetchLatestBaileysVersion();
+        
+        const waClient = makeWASocket({
+            version,
+            auth: {
+                creds: state.creds,
+                keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "fatal" }).child({ level: "fatal" }))
+            },
+            printQRInTerminal: false,
+            logger: pino({ level: "fatal" }).child({ level: "fatal" }),
+            browser: Browsers.ubuntu('Chrome'),
+            syncFullHistory: false,
+            generateHighQualityLinkPreview: true,
+            shouldIgnoreJid: jid => isJidBroadcast(jid),
+            getMessage: async key => {
+                return {}
+            }
+        });
+
+        if (!waClient.authState.creds.registered) {
+            await delay(1500);
+            
+            const phoneNumber = num.replace(/[^0-9]/g, "");
+            const code = await waClient.requestPairingCode(phoneNumber);
+            
+            activeClients.set(sessionId, {  
+                client: waClient,  
+                number: num,  
+                authPath: sessionPath  
+            });  
+
+            res.send(`  
+                <div style="margin-top: 20px; padding: 20px; background: rgba(20, 40, 80, 0.8); border-radius: 10px; border: 1px solid #4deeea;">
+                    <h2>Pairing Code: ${code}</h2>  
+                    <p style="font-size: 18px; margin-bottom: 20px;">Save this code to pair your device</p>
+                    <div class="instructions">
+                        <p style="font-size: 16px;"><strong>To pair your device:</strong></p>
+                        <ol>
+                            <li>Open WhatsApp on your phone</li>
+                            <li>Go to Settings → Linked Devices → Link a Device</li>
+                            <li>Enter this pairing code when prompted</li>
+                            <li>After pairing, start sending messages using the form below</li>
+                        </ol>
+                    </div>
+                    <a href="/">Go Back to Home</a>  
+                </div>  
+            `);  
+        }  
+
+        waClient.ev.on("creds.update", saveCreds);  
+        waClient.ev.on("connection.update", async (s) => {  
+            const { connection, lastDisconnect } = s;  
+            if (connection === "open") {  
+                console.log(`WhatsApp Connected for ${num}! Session ID: ${sessionId}`);  
+            } else if (connection === "close" && lastDisconnect?.error?.output?.statusCode !== 401) {  
+                console.log(`Reconnecting for Session ID: ${sessionId}...`);  
+                await delay(10000);  
+                initializeClient(sessionId, num, sessionPath);  
+            }  
+        });
+
+    } catch (err) {
+        console.error("Error in pairing:", err);
+        res.send(`<div style="padding: 20px; background: rgba(80,0,0,0.8); border-radius: 10px; border: 1px solid #ff5555;">
+                    <h2>Error: ${err.message}</h2><br><a href="/">Go Back</a>
+                  </div>`);
+    }
+});
+
+async function initializeClient(sessionId, num, sessionPath) {
+    try {
+        const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
+        const { version } = await fetchLatestBaileysVersion();
+        
+        const waClient = makeWASocket({
+            version,
+            auth: {
+                creds: state.creds,
+                keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "fatal" }).child({ level: "fatal" }))
+            },
+            printQRInTerminal: false,
+            logger: pino({ level: "fatal" }).child({ level: "fatal" }),
+            browser: Browsers.ubuntu('Chrome'),
+            syncFullHistory: false
+        });
+
+        activeClients.set(sessionId, {  
+            client: waClient,  
+            number: num,  
+            authPath: sessionPath  
+        });  
+
+        waClient.ev.on("creds.update", saveCreds);  
+        waClient.ev.on("connection.update", async (s) => {  
+            const { connection, lastDisconnect } = s;  
+            if (connection === "open") {  
+                console.log(`Reconnected successfully for Session ID: ${sessionId}`);  
+            } else if (connection === "close" && lastDisconnect?.error?.output?.statusCode !== 401) {  
+                console.log(`Reconnecting again for Session ID: ${sessionId}...`);  
+                await delay(10000);  
+                initializeClient(sessionId, num, sessionPath);  
+            }  
+        });
+
+    } catch (err) {
+        console.error(`Reconnection failed for Session ID: ${sessionId}`, err);
+    }
+}
+
+app.post("/send-message", upload.single("messageFile"), async (req, res) => {
+    const { target, targetType, delaySec, prefix } = req.body;
+    const taskId = `task_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
+    
+    // Find the most recent session for this IP (simplified approach)
+    let sessionId;
+    let clientInfo;
+    for (const [key, value] of activeClients.entries()) {
+        sessionId = key;
+        clientInfo = value;
+        break; // Use the first active session
+    }
+
+    if (!sessionId || !clientInfo) {
+        return res.send(`<div class="box"><h2>Error: No active WhatsApp session found</h2><br><a href="/">Go Back</a></div>`);
+    }
+
+    const { client: waClient } = clientInfo;
+    const filePath = req.file?.path;
+
+    if (!target || !filePath || !targetType || !delaySec) {
+        return res.send(`<div class="box"><h2>Error: Missing required fields</h2><br><a href="/">Go Back</a></div>`);
+    }
+
+    try {
+        const messages = fs.readFileSync(filePath, "utf-8").split("\n").filter(msg => msg.trim() !== "");
+        let index = 0;
+
+        // Store task information
+        const taskInfo = {
+            sessionId,
+            isSending: true,
+            stopRequested: false,
+            totalMessages: messages.length,
+            sentMessages: 0,
+            target,
+            startTime: new Date()
+        };
+        
+        activeTasks.set(taskId, taskInfo);
+        
+        // Save task ID to localStorage via client
+        res.send(`<script>
+                    localStorage.setItem('wa_task_id', '${taskId}');
+                    window.location.href = '/task-status?taskId=${taskId}';
+                  </script>`);
+        
+        // Start sending messages
+        while (taskInfo.isSending && !taskInfo.stopRequested) {  
+            let msg = messages[index];  
+            if (prefix && prefix.trim() !== "") {  
+                msg = `${prefix.trim()} ${msg}`;  
+            }  
+            
+            const recipient = targetType === "group" ? target + "@g.us" : target + "@s.whatsapp.net";
+
+            await waClient.sendMessage(recipient, { text: msg });  
+            console.log(`[${taskId}] Sent message to ${target}`);  
+
+            taskInfo.sentMessages++;
+            index = (index + 1) % messages.length;  
+            await delay(delaySec * 1000);  
+        }  
+
+        // Update task status when done
+        taskInfo.endTime = new Date();
+        taskInfo.isSending = false;
+
+    } catch (error) {
+        console.error(`[${taskId}] Error:`, error);
+        taskInfo.error = error.message;
+        taskInfo.isSending = false;
+    } finally {
+        if (fs.existsSync(filePath)) {
+            fs.unlinkSync(filePath);
+        }
+    }
+});
+
+app.get("/task-status", (req, res) => {
+    const taskId = req.query.taskId;
+    if (!taskId || !activeTasks.has(taskId)) {
+        return res.send(`<div class="box"><h2>Error: Invalid Task ID</h2><br><a href="/">Go Back</a></div>`);
+    }
+
+    const taskInfo = activeTasks.get(taskId);
+    res.send(`
+        <html>
+        <head>
+            <title>Task Status</title>
+            <style>
+                body { 
+                    background: #0a0a2a;
+                    color: #e0e0ff;
+                    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                    text-align: center;
+                    padding: 20px;
+                }
+                .container {
+                    max-width: 800px;
+                    margin: 0 auto;
+                }
+                .status-box {
+                    background: rgba(20, 40, 60, 0.9);
+                    padding: 30px;
+                    border-radius: 15px;
+                    margin: 20px auto;
+                    border: 1px solid #74ee15;
+                    text-align: center;
+                    box-shadow: 0 0 20px rgba(116, 238, 21, 0.3);
+                }
+                h1 {
+                    color: #4deeea;
+                    text-shadow: 0 0 10px rgba(77, 238, 234, 0.7);
+                }
+                .task-id {
+                    font-size: 24px;
+                    background: rgba(30, 50, 90, 0.7);
+                    padding: 15px;
+                    border-radius: 10px;
+                    display: inline-block;
+                    margin: 20px 0;
+                    border: 1px solid #4deeea;
+                }
+                .status-item {
+                    margin: 15px 0;
+                    font-size: 20px;
+                }
+                .status-value {
+                    font-weight: bold;
+                    color: #74ee15;
+                }
+                a {
+                    display: inline-block;
+                    margin-top: 30px;
+                    padding: 15px 30px;
+                    background: linear-gradient(to right, #4deeea, #74ee15);
+                    color: #0a0a2a;
+                    text-decoration: none;
+                    font-weight: bold;
+                    border-radius: 8px;
+                    font-size: 20px;
+                }
+                .progress-container {
+                    width: 80%;
+                    height: 30px;
+                    background: rgba(50, 50, 100, 0.5);
+                    border-radius: 15px;
+                    margin: 30px auto;
+                    overflow: hidden;
+                }
+                .progress-bar {
+                    height: 100%;
+                    background: linear-gradient(to right, #4deeea, #74ee15);
+                    width: ${Math.min(100, Math.floor((taskInfo.sentMessages / taskInfo.totalMessages) * 100))}%;
+                    transition: width 0.5s;
+                }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>Task Status</h1>
+                
+                <div class="status-box">
+                    <div class="task-id">Your Task ID: ${taskId}</div>
+                    
+                    <div class="status-item">
+                        Status: <span class="status-value">${taskInfo.isSending ? 'RUNNING' : taskInfo.stopRequested ? 'STOPPED' : 'COMPLETED'}</span>
+                    </div>
+                    
+                    <div class="status-item">
+                        Target: <span class="status-value">${taskInfo.target}</span>
+                    </div>
+                    
+                    <div class="status-item">
+                        Messages Sent: <span class="status-value">${taskInfo.sentMessages} / ${taskInfo.totalMessages}</span>
+                    </div>
+                    
+                    <div class="progress-container">
+                        <div class="progress-bar"></div>
+                    </div>
+                    
+                    <div class="status-item">
+                        Start Time: <span class="status-value">${taskInfo.startTime.toLocaleString()}</span>
+                    </div>
+                    
+                    ${taskInfo.endTime ? `
+                    <div class="status-item">
+                        End Time: <span class="status-value">${taskInfo.endTime.toLocaleString()}</span>
+                    </div>
+                    ` : ''}
+                    
+                    ${taskInfo.error ? `
+                    <div class="status-item" style="color:#ff5555;">
+                        Error: ${taskInfo.error}
+                    </div>
+                    ` : ''}
+                    
+                    <form action="/stop-task" method="POST" style="margin-top:30px;">
+                        <input type="hidden" name="taskId" value="${taskId}">
+                        <button type="submit" style="background:linear-gradient(to right, #ff5555, #ff0000);">
+                            Stop This Task
+                        </button>
+                    </form>
+                </div>
+                
+                <a href="/">Return to Home</a>
+            </div>
+        </body>
+        </html>
+    `);
+});
+
+app.post("/stop-task", async (req, res) => {
+    const { taskId } = req.body;
+
+    if (!activeTasks.has(taskId)) {
+        return res.send(`<div class="box"><h2>Error: Invalid Task ID</h2><br><a href="/">Go Back</a></div>`);
+    }
+
+    try {
+        const taskInfo = activeTasks.get(taskId);
+        taskInfo.stopRequested = true;
+        taskInfo.isSending = false;
+        taskInfo.endTime = new Date();
+
+        res.send(`  
+            <div class="box">  
+                <h2>Task ${taskId} stopped successfully</h2>
+                <p>Messages sent: ${taskInfo.sentMessages}</p>
+                <p>Start time: ${taskInfo.startTime.toLocaleString()}</p>
+                <p>End time: ${taskInfo.endTime.toLocaleString()}</p>
+                <br><a href="/">Go Back to Home</a>  
+            </div>  
+        `);
+
+    } catch (error) {
+        console.error(`Error stopping task ${taskId}:`, error);
+        res.send(`<div class="box"><h2>Error stopping task</h2><p>${error.message}</p><br><a href="/">Go Back</a></div>`);
+    }
+});
+
+process.on('SIGINT', () => {
+    console.log('Shutting down gracefully...');
+    activeClients.forEach(({ client }, sessionId) => {
+        client.end();
+        console.log(`Closed connection for Session ID: ${sessionId}`);
+    });
+    process.exit();
+});
+
+app.listen(PORT, () => {
+    console.log(`Server running on http://localhost:${PORT}`);
 });
